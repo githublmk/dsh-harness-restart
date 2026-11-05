@@ -1,0 +1,4 @@
+- insert:
+    - id: harness-restart
+      name: 'dsh-harness-restart'
+      config: {}

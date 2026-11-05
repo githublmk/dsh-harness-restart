@@ -1,0 +1,75 @@
+{
+  "name": "dsh-harness-restart",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Restart control for the DeepSeek Harness Desktop caption band: restarts the app and its Host after a confirmation, from a button placed right after the panel nav's overflow launcher.",
+  "icon": "icon.svg",
+  "license": "MIT",
+  "author": {
+    "name": "githublmk",
+    "url": "https://github.com/githublmk"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/githublmk/dsh-harness-restart.git"
+  },
+  "homepage": "https://github.com/githublmk/dsh-harness-restart#readme",
+  "bugs": {
+    "url": "https://github.com/githublmk/dsh-harness-restart/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "harness",
+    "cordis",
+    "restart",
+    "relaunch",
+    "titlebar",
+    "windows"
+  ],
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-0"
+  },
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./relaunch": "./relaunch.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "relaunch.mjs",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "README.en.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "node --check index.js && node --check client.js && node --check relaunch.mjs && node --check test/smoke-client.mjs",
+    "test": "node test/smoke-client.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  }
+}

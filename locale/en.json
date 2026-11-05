@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Restart Harness",
+    "description": "Adds a Restart control to the Desktop caption band, right after the panel nav's overflow, that restarts the app and Host after a confirmation."
+  }
+}

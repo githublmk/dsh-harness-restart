@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "重启 Harness",
+    "description": "在桌面标题栏菜单条的「更多」之后加一个重启按钮，确认后重启应用与 Host。"
+  }
+}
