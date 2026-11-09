@@ -82,6 +82,18 @@ Every key is optional:
 | `maxTasks` | `8` | Tasks per plan (also the most task lines the popover accepts) |
 | `storeDir` | `null` | Override the plan directory (default `$DSH_HOME/harness-restart`) |
 
+### Turning the tool approval off (optional)
+
+When the Session's approval policy is `never`, no card can appear and the tool fails closed with `not-approved` (`approval-unavailable` when no answerer exists); with `requireApproval: true` it therefore cannot restart. To let the tool restart directly, override the row in the **profile's** `cordis.patch.yml`:
+
+```yaml
+- id: harness-restart
+  config:
+    requireApproval: false
+```
+
+The tradeoff is that the model may restart the app without a card (the caption-band button is unaffected: it has its own confirmation). With `patchReload: live` the change usually applies within seconds; otherwise on the next start.
+
 ## Data and logs
 
 Plans and receipts: `$DSH_HOME\harness-restart\` — `plan.json` (atomic tmp+fsync+rename; corrupt files are renamed `plan.json.corrupt-*`), `history.jsonl`, `restart.lock`.

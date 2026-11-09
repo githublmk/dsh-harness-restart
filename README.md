@@ -111,6 +111,18 @@ plugin_manager install_bundle D:\path\to\dsh-harness-restart
 | `maxTasks` | `8` | 单次重启最多排多少个任务（也决定气泡里最多接受几行） |
 | `storeDir` | `null` | 覆盖计划目录（默认 `$DSH_HOME/harness-restart`） |
 
+### 关闭工具审批（可选）
+
+会话的审批策略是 `never` 时，审批卡不会被弹出，工具会按「失败关闭」返回 `not-approved`（没有应答者时是 `approval-unavailable`）；`requireApproval: true` 下工具因此无法重启。希望工具直接重启时，在 **profile** 的 `cordis.patch.yml` 里覆盖这一行：
+
+```yaml
+- id: harness-restart
+  config:
+    requireApproval: false
+```
+
+代价是模型可以在没有卡片的情况下重启应用（标题栏按钮不受影响，它本来就有自己的确认气泡）。改了 patch 后若 profile 开启 `patchReload: live`，通常几秒内生效，否则下次启动生效。
+
 ## 数据与日志
 
 **计划与回执**：`$DSH_HOME\harness-restart\`

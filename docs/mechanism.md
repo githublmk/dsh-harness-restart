@@ -144,7 +144,7 @@ Update for version 0.2.1-rc.5 is not available (latest version: 0.2.2-rc.1, down
 ```json
 {
   "ok": true,
-  "version": "0.4.1",
+  "version": "0.4.2",
   "supported": true,
   "capabilities": ["restart", "resume", "tasks"],
   "lastPlan": { "planId": "rst-…", "at": 0, "finishedAt": 0, "ok": true, "resumed": 2, "tasks": 1 }
@@ -188,6 +188,24 @@ Update for version 0.2.1-rc.5 is not available (latest version: 0.2.2-rc.1, down
 - **取消要拿锁**：`harness_restart_cancel` 先抢重启锁，抢不到说明请求正在执行，直接回答 `cancelled:false`，不会删掉已经排给定时器的计划。
 - **拉起判定区分未知**：`relaunch.mjs` 在 `tasklist` 不可读时按「未知」处理、不再直接 spawn 第二个实例；pid 参数非法时跳过等待仍然拉起应用；日志目录先建再写。
 - **语言探测接口也加闸**：`PUT /dsh-harness-restart/restart` 需要 `x-dsh-restart-probe: 1`，与 `POST` 的 `x-dsh-restart-action` 各管各的。
+
+## 真机验证记录（2026-11-09 15:24，0.4.1）
+
+一次完整的工具路径重启（计划 `rst-20261109-152417-pev6`，应用由助手自动拉起，非手动）：
+
+| 时间 | 事件 |
+| --- | --- |
+| 15:24:17.409 | 计划写入（`origin: tool`，恢复本会话 + 1 个任务） |
+| 15:24:17.9 | 助手 ready（pid 23508），Host 记录 `assistant ready` |
+| 15:24:19.4 | `flushed 2 session(s)` → 杀壳 → `shell stopped; the relaunch assistant takes over` |
+| 15:24:19.45 | `relauncher: shell and host are gone` |
+| 15:24:22.4 | `shell launch: application processes before=1`（explorer 拉起） |
+| 15:24:28.9 | `launched through shell; application processes=6` → `done` → `exited code=0` |
+| 15:24:32.2 | 新 Host 续作投递本会话成功（`restore: resume … -> delivered`） |
+| 15:24:33.1 | 任务投递到新会话 `session-171c1833…`（`task … -> delivered`） |
+| 15:24:33.15 | `plan-done ok:true`，plan 状态 `done` |
+
+这条记录同时证明 0.4.1 的修复有效：助手不再停在 `shell gone`，而是完整走完 `shell and host are gone → launched → done`。回执顺序为 `plan → shell-stopped → relaunch-host-gone → relaunch-launching → relaunch-ok → resume → task → plan-done`。
 
 ## 未走完的路（后续计划）
 

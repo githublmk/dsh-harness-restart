@@ -134,7 +134,9 @@ if (shell !== null && alive(shell)) {
 
 const hostAlive = host !== null && alive(host)
 log(hostAlive ? 'shell is gone; the old host is still leaving' : 'shell and host are gone')
-if (!hostAlive) receipt('shell-stopped')
+/* The Host already recorded `shell-stopped` when its own poll confirmed the
+ * kill; this receipt is the assistant's independent observation. */
+receipt('relaunch-host-gone', hostAlive ? { hostAlive: true } : {})
 /* Record the attempt before the settle delay: a helper that dies during it must
  * still be visible in the plan's history. */
 receipt('relaunch-launching', { appExe })

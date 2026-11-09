@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.2
+
+- 助手不再写第二条 `shell-stopped` 回执：它记录 `relaunch-host-gone`（Host 侧的 `shell-stopped` 保留），回执口径不再重复。
+- README(.en) 增补「关闭工具审批」的 profile 覆盖示例：会话审批策略为 `never` 时工具会失败关闭（`not-approved`），要直接重启需显式设 `requireApproval: false`。
+- `docs/mechanism.md` 增加 2026-11-09 15:24 的 0.4.1 真机验证时序（助手自动拉起、续作与任务投递、`plan-done`）。
+- 版本握手升到 0.4.2。
+
 ## 0.4.1
 
 - 修掉 `relaunch.mjs` 的静默退出：助手在等待壳/Host 消失时用了 `unref()` 定时器，事件循环被清空后进程直接退出，**壳已经停了但应用没被拉起**（真机 15:13 那次复现：日志停在 `host: shell gone`，应用是手动重开的）。现在 `sleep` 不再 unref，并额外用一个 keep-alive 定时器兜底；任何提前退出都会在日志里留下 `relauncher: exited code=…`。
