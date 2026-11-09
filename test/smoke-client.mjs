@@ -4,8 +4,11 @@
  * Runs the real client.js against a minimal React shim and a fake caption-row
  * DOM: it proves the factory loads, the slot registration targets
  * `shell.overlay`, the control renders after the "更多" launcher, the version
- * probe gates the action, the confirm popover opens, and confirming posts the
- * accepted request. It also covers the outdated-Host path.
+ * probe gates the action, the confirm popover offers the resume switch and the
+ * task box, confirming posts the accepted request exactly once, an uncheck
+ * turns the resume policy off, the Host's task limit is honored, a refused
+ * request leaves a usable control, an outdated or unsupported Host is refused,
+ * and a finished plan shows the post-restart notice.
  */
 import { readFileSync } from 'node:fs'
 
@@ -51,15 +54,41 @@ const fakeReact = {
   useCallback: hooks.useCallback,
 }
 
-/** Set by each scenario: what the fake Host reports. */
-let hostVersion = '0.3.0'
+/** What the fake Host reports; each scenario adjusts it. */
+const host = {
+  version: '0.4.0',
+  supported: true,
+  resumeDefault: 'interrupted',
+  maxTasks: 8,
+  postStatus: 202,
+  lastPlan: null,
+}
 const requests = []
 globalThis.fetch = async (url, init) => {
-  requests.push({ url, method: init?.method ?? 'GET', headers: init?.headers ?? {} })
-  if ((init?.method ?? 'GET') === 'GET') {
-    return { ok: true, status: 200, json: async () => ({ ok: true, version: hostVersion, supported: true }) }
+  const method = init?.method ?? 'GET'
+  requests.push({ url, method, headers: init?.headers ?? {}, body: init?.body })
+  if (method === 'PUT') return { ok: true, status: 204, json: async () => ({ ok: true }) }
+  if (method === 'GET') {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        version: host.version,
+        supported: host.supported,
+        capabilities: ['restart', 'resume', 'tasks'],
+        resumeDefault: host.resumeDefault,
+        maxTasks: host.maxTasks,
+        lastPlan: host.lastPlan,
+      }),
+    }
   }
-  return { ok: true, status: 202, json: async () => ({ ok: true, status: 'restarting' }) }
+  const accepted = host.postStatus >= 200 && host.postStatus < 300
+  return {
+    ok: accepted,
+    status: host.postStatus,
+    json: async () => (accepted ? { ok: true, status: 'restarting' } : { ok: false, error: 'failed' }),
+  }
 }
 
 const launcher = {
@@ -113,104 +142,201 @@ function render(component) {
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 10))
 
+/** Mount one fresh Client half; returns its component and the second render. */
+function mount() {
+  registrations.length = 0
+  hooks.reset()
+  const api = definition.factory((name) => {
+    if (name === 'react') return fakeReact
+    throw new Error(`unexpected module ${name}`)
+  })
+  api.apply({
+    slots: {
+      inject: (owner, callback) => {
+        if (owner !== 'shell.overlay') throw new Error(`unexpected owner slot ${owner}`)
+        callback()
+      },
+      register: (options, component) => {
+        registrations.push({ options, component })
+        return { options, component }
+      },
+    },
+    locale,
+    effect: (fn) => fn(),
+  })
+  if (registrations.length !== 1) throw new Error(`expected one registration, got ${registrations.length}`)
+  const { options, component } = registrations[0]
+  if (options.name !== 'shell.overlay' || options.id !== 'harness-restart') {
+    throw new Error(`unexpected registration ${JSON.stringify(options)}`)
+  }
+  render(component)
+  return { component, tree: render(component) }
+}
+
+/** Click the control, wait for the probe, and return the open dialog. */
+async function open(component, tree) {
+  const control = find(tree, (node) => node.type === 'button')
+  if (control === null) throw new Error('no control button in the tree')
+  control.props.onClick()
+  await tick()
+  const dialog = find(render(component), (node) => node.props?.role === 'dialog')
+  if (dialog === null) throw new Error('the confirm popover did not open')
+  return dialog
+}
+
+/** Click the confirm button inside one dialog. */
+function confirm(dialog) {
+  const button = findAll(dialog, (node) => node.type === 'button' && textOf(node) === '重启').at(-1)
+  if (button === undefined) throw new Error('no confirm button in the popover')
+  button.props.onClick()
+}
+
+const posts = () => requests.filter((request) => request.method === 'POST')
+
 eval(source)
 if (definition === undefined) throw new Error('module loader was not used')
 if (definition.id !== 'dsh-harness-restart') throw new Error(`unexpected module id ${definition.id}`)
 
-const api = definition.factory((name) => {
-  if (name === 'react') return fakeReact
-  throw new Error(`unexpected module ${name}`)
-})
-api.apply({
-  slots: {
-    inject: (owner, callback) => {
-      if (owner !== 'shell.overlay') throw new Error(`unexpected owner slot ${owner}`)
-      callback()
-    },
-    register: (options, component) => {
-      registrations.push({ options, component })
-      return { options, component }
-    },
-  },
-  locale,
-  effect: (fn) => fn(),
-})
+// --- accepted Host: the default request, posted exactly once
+{
+  const { component, tree } = mount()
+  const control = find(tree, (node) => node.type === 'button')
+  if (control.props.style.left !== 1138) throw new Error(`unexpected left ${control.props.style.left}`)
+  if (textOf(control) !== '重启') throw new Error(`expected the Chinese label, saw ${JSON.stringify(textOf(control))}`)
+  const dialog = await open(component, tree)
+  const popoverText = textOf(dialog)
+  for (const expected of ['正在进行的任务会被中断', '重启后继续被中断的会话', '重启后任务（可选，每行一条）']) {
+    if (!popoverText.includes(expected)) throw new Error(`unexpected popover copy ${JSON.stringify(popoverText)}`)
+  }
+  const probe = requests.find((request) => request.method === 'GET')
+  if (probe === undefined) throw new Error('no GET probe was sent')
+  console.log('probe:', probe.method, probe.url, '->', host.version)
+  console.log('popover:', JSON.stringify(popoverText))
 
-if (registrations.length !== 1) throw new Error(`expected one registration, got ${registrations.length}`)
-const { options, component } = registrations[0]
-if (options.name !== 'shell.overlay' || options.id !== 'harness-restart') {
-  throw new Error(`unexpected registration ${JSON.stringify(options)}`)
+  /* Two clicks in the same frame must still produce one request. */
+  confirm(dialog)
+  confirm(dialog)
+  await tick()
+  const sent = posts()
+  if (sent.length !== 1) throw new Error(`expected one POST, saw ${sent.length}`)
+  const posted = JSON.parse(sent[0].body)
+  if (posted.resume !== 'interrupted') throw new Error(`unexpected resume policy ${JSON.stringify(posted.resume)}`)
+  if (!Array.isArray(posted.tasks) || posted.tasks.length !== 0) throw new Error(`unexpected tasks ${JSON.stringify(posted.tasks)}`)
+  if (posted.language !== 'zh-CN') throw new Error(`unexpected language ${JSON.stringify(posted.language)}`)
+  console.log('request:', sent[0].method, sent[0].url, JSON.stringify(posted))
 }
-console.log('registration:', options.name, options.id, 'order', options.order)
 
-render(component)
-const tree = render(component)
-if (tree === null) throw new Error('the control did not render after measuring the caption row')
-const button = find(tree, (node) => node.type === 'button')
-if (button === null) throw new Error('no button in the tree')
-if (button.props.style.left !== 1138) throw new Error(`unexpected left ${button.props.style.left}`)
-const label = textOf(button)
-if (label !== '重启') throw new Error(`expected the Chinese label, saw ${JSON.stringify(label)}`)
-console.log('button:', JSON.stringify(label), 'left', button.props.style.left, 'top', button.props.style.top)
-
-// --- accepted Host: probe passes, confirm dialog appears
-button.props.onClick()
-await tick()
-const opened = render(component)
-const dialog = find(opened, (node) => node.props?.role === 'dialog')
-if (dialog === null) throw new Error('the confirm popover did not open')
-const popoverText = textOf(dialog)
-if (!popoverText.includes('正在进行的任务会被中断')) {
-  throw new Error(`unexpected popover copy ${JSON.stringify(popoverText)}`)
+// --- the resume switch off: policy none and the matching copy
+{
+  requests.length = 0
+  const { component, tree } = mount()
+  const dialog = await open(component, tree)
+  const checkbox = find(dialog, (node) => node.type === 'input' && node.props.type === 'checkbox')
+  if (checkbox === null) throw new Error('no resume switch in the popover')
+  checkbox.props.onChange()
+  const updated = find(render(component), (node) => node.props?.role === 'dialog')
+  if (!textOf(updated).includes('本次重启不会恢复被中断的会话')) {
+    throw new Error(`unexpected unchecked copy ${JSON.stringify(textOf(updated))}`)
+  }
+  confirm(updated)
+  await tick()
+  const posted = JSON.parse(posts()[0].body)
+  if (posted.resume !== 'none') throw new Error(`unexpected unchecked policy ${JSON.stringify(posted.resume)}`)
+  console.log('unchecked request:', JSON.stringify(posted))
 }
-const probeRequest = requests.find((request) => request.method === 'GET')
-if (probeRequest === undefined) throw new Error('no GET probe was sent')
-console.log('probe:', probeRequest.method, probeRequest.url, '->', hostVersion)
-console.log('popover:', JSON.stringify(popoverText))
 
-const confirmButton = find(dialog, (node) => node.type === 'button' && textOf(node) === '重启')
-if (confirmButton === null) throw new Error('no confirm button in the popover')
-confirmButton.props.onClick()
-await tick()
-const post = requests.find((request) => request.method === 'POST')
-if (post === undefined) throw new Error('no POST was sent')
-if (post.url.toLowerCase() !== '/dsh-harness-restart/restart') throw new Error(`unexpected route ${post.url}`)
-if (post.headers['x-dsh-restart-action'] !== 'restart') throw new Error('missing action header')
-console.log('request:', post.method, post.url, JSON.stringify(post.headers))
-
-// --- outdated Host: the action is refused with an explanation
-const fresh = definition.factory((name) => {
-  if (name === 'react') return fakeReact
-  throw new Error(`unexpected module ${name}`)
-})
-registrations.length = 0
-fresh.apply({
-  slots: {
-    inject: (owner, callback) => { callback() },
-    register: (opts, comp) => { registrations.push({ options: opts, component: comp }); return opts },
-  },
-  locale,
-  effect: (fn) => fn(),
-})
-const second = registrations[0].component
-hostVersion = '0.2.0'
-requests.length = 0
-hooks.reset()
-render(second)
-const secondTree = render(second)
-const secondButton = find(secondTree, (node) => node.type === 'button')
-secondButton.props.onClick()
-await tick()
-const blocked = render(second)
-const blockedDialog = find(blocked, (node) => node.props?.role === 'dialog')
-if (blockedDialog === null) throw new Error('the outdated popover did not open')
-const blockedText = textOf(blockedDialog)
-if (!blockedText.includes('先重开一次应用')) {
-  throw new Error(`unexpected outdated copy ${JSON.stringify(blockedText)}`)
+// --- the Host limits the task list
+{
+  requests.length = 0
+  host.maxTasks = 2
+  const { component, tree } = mount()
+  const dialog = await open(component, tree)
+  const textarea = find(dialog, (node) => node.type === 'textarea')
+  if (textarea === null) throw new Error('no task box in the popover')
+  textarea.props.onChange({ target: { value: 'one\ntwo\nthree\n' } })
+  const updated = find(render(component), (node) => node.props?.role === 'dialog')
+  confirm(updated)
+  await tick()
+  const posted = JSON.parse(posts()[0].body)
+  if (posted.tasks.length !== 2) throw new Error(`expected the Host limit to apply, saw ${JSON.stringify(posted.tasks)}`)
+  console.log('limited tasks:', JSON.stringify(posted.tasks))
+  host.maxTasks = 8
 }
-const buttons = findAll(blockedDialog, (node) => node.type === 'button')
-if (buttons.length !== 1) throw new Error(`expected one button in the outdated popover, got ${buttons.length}`)
-if (requests.some((request) => request.method === 'POST')) throw new Error('an outdated Host must never be asked to restart')
-console.log('outdated:', JSON.stringify(blockedText), '| buttons:', buttons.length)
+
+// --- a refused request leaves a usable control
+{
+  requests.length = 0
+  host.postStatus = 500
+  const { component, tree } = mount()
+  confirm(await open(component, tree))
+  await tick()
+  const after = render(component)
+  const control = find(after, (node) => node.type === 'button')
+  if (!textOf(control).includes('重启')) throw new Error('the control stayed busy after a refused request')
+  const dialog = find(after, (node) => node.props?.role === 'dialog')
+  if (dialog === null) throw new Error('the failure popover did not reopen')
+  if (!textOf(dialog).includes('没有被接受')) throw new Error(`unexpected failure copy ${JSON.stringify(textOf(dialog))}`)
+  console.log('refused:', JSON.stringify(textOf(dialog)))
+  host.postStatus = 202
+}
+
+// --- outdated Host
+{
+  host.version = '0.2.0'
+  requests.length = 0
+  const { component, tree } = mount()
+  const dialog = await open(component, tree)
+  if (!textOf(dialog).includes('先重开一次应用')) throw new Error(`unexpected outdated copy ${JSON.stringify(textOf(dialog))}`)
+  const buttons = findAll(dialog, (node) => node.type === 'button')
+  if (buttons.length !== 1) throw new Error(`expected one button in the outdated popover, got ${buttons.length}`)
+  if (posts().length !== 0) throw new Error('an outdated Host must never be asked to restart')
+  console.log('outdated:', JSON.stringify(textOf(dialog)))
+  host.version = '0.4.0'
+}
+
+// --- unsupported Host
+{
+  host.supported = false
+  requests.length = 0
+  const { component, tree } = mount()
+  const dialog = await open(component, tree)
+  if (!textOf(dialog).includes('不支持自动重启')) throw new Error(`unexpected unsupported copy ${JSON.stringify(textOf(dialog))}`)
+  if (posts().length !== 0) throw new Error('an unsupported Host must never be asked to restart')
+  console.log('unsupported:', JSON.stringify(textOf(dialog)))
+  host.supported = true
+}
+
+// --- the profile's resume policy preselects the switch
+{
+  host.resumeDefault = 'none'
+  const { component, tree } = mount()
+  const dialog = await open(component, tree)
+  if (!textOf(dialog).includes('本次重启不会恢复被中断的会话')) {
+    throw new Error(`the profile policy did not preselect the switch: ${JSON.stringify(textOf(dialog))}`)
+  }
+  console.log('profile default:', JSON.stringify(textOf(dialog)))
+  host.resumeDefault = 'interrupted'
+}
+
+// --- finished plan: the page says what the restart did
+{
+  host.lastPlan = {
+    planId: 'rst-notice',
+    at: Date.now() - 2000,
+    finishedAt: Date.now() - 2000,
+    ok: true,
+    resumed: 2,
+    tasks: 1,
+  }
+  const { component } = mount()
+  await tick()
+  const notice = find(render(component), (node) => node.props?.role === 'status')
+  if (notice === null) throw new Error('the post-restart notice did not render')
+  const noticeText = textOf(notice)
+  if (!noticeText.includes('已恢复 2 个会话') || !noticeText.includes('启动 1 个任务')) {
+    throw new Error(`unexpected notice copy ${JSON.stringify(noticeText)}`)
+  }
+  console.log('notice:', JSON.stringify(noticeText))
+}
 
 console.log('SMOKE OK')

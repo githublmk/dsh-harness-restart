@@ -3,225 +3,54 @@
  *
  * The Desktop application runs this Host as a child process of the Electron
  * shell, so the Host cannot call `app.relaunch()` and the packaged Application
- * menu has no restart item. This module therefore answers one authenticated
- * same-origin request from the Client half and restarts the application.
+ * menu has no restart item. This module therefore:
  *
- * The Host cannot relaunch after stopping the shell either: `dsh-desktop-host`
- * calls its own shutdown on `process.disconnect`, so the moment the shell dies
- * this process starts stopping. The restart is therefore carried out by
- * `relaunch.mjs`, a detached assistant started *before* the shell is stopped: it
- * waits until the shell and this Host are gone and then starts the application
- * with a clean environment.
+ * 1. answers one authenticated same-origin request from the Client half and
+ *    restarts the application (v0.3.0 path, still the only one that works in a
+ *    packaged build);
+ * 2. registers the `harness_restart*` tools, so an Agent can request the same
+ *    restart and describe what should happen afterwards;
+ * 3. runs the boot restore: the plan a previous process wrote is turned into
+ *    continuation prompts for the Sessions it interrupted and into the tasks it
+ *    queued.
  *
- * Every step is verified before the next one runs, so a failed restart leaves
- * the running application untouched instead of killing half of it: the shell is
- * only stopped after the assistant proved it is running, and a kill that does
- * not take effect is reported back to the page.
+ * The shell is only stopped after `relaunch.mjs` proved it is running, and
+ * always after the plan and the tool result reached disk; a failed stop aborts
+ * the plan so the next normal start cannot surprise anyone.
  *
  * @module dsh-harness-restart
  */
-import { spawn } from 'node:child_process'
-import { appendFileSync, existsSync, mkdirSync, rmSync } from 'node:fs'
-import { dirname, join } from 'node:path'
-import { tmpdir } from 'node:os'
-import { fileURLToPath } from 'node:url'
+import { appendFileSync, mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
 
-/** Version the Client half requires before it offers the action. */
-const VERSION = '0.3.0'
-/** Same-origin route the Client half talks to; no other path is claimed. */
-const ROUTE_PATH = '/dsh-harness-restart/restart'
-/** Request header only this page's fetch sets; a cross-site form cannot send it. */
-const ACTION_HEADER = 'x-dsh-restart-action'
-/** Exact header value; absent or different is rejected before anything happens. */
-const ACTION_VALUE = 'restart'
-/** How long the assistant has to prove it is running before anything is stopped. */
-const ASSISTANT_READY_TIMEOUT_MS = 4000
-/** Upper bound on waiting for the stopped shell to leave the process table. */
-const SHELL_EXIT_TIMEOUT_MS = 3000
-/** Delay before this Host leaves when the shell's disconnect does not end it. */
-const SELF_EXIT_DELAY_MS = 1500
-/** Whether one restart request is already being carried out. */
-let pending = false
+import {
+  ACTION_HEADER, ACTION_VALUE, PROBE_HEADER, PROBE_VALUE, ROUTE_PATH, VERSION, resolveConfig,
+} from './lib/config.js'
+import { recentPlanSummary, storeDirectory } from './lib/plan.js'
+import { normalizeResumeMode } from './lib/policy.js'
+import { scheduleBootRestore } from './lib/resume.js'
+import { createLogger, desktopHost, normalizeTasks, requestRestart, runtimePaths } from './lib/restart.js'
+import { createTools } from './lib/tools.js'
 
-/** Working directory for the assistant, its log, and its ready marker. */
-const RUNTIME_DIR = join(tmpdir(), 'dsh-harness-restart')
-/** Step log written by this half and by the assistant. */
-const LOG_FILE = join(RUNTIME_DIR, 'restart.log')
-/** File the assistant writes first; its absence means no relaunch path exists. */
-const READY_MARKER = join(RUNTIME_DIR, 'relauncher-ready.txt')
+export const name = 'harness-restart'
+export const inject = ['webServer', 'tools']
 
 /**
- * Detect the Desktop Host: the shell starts this process with the Electron
- * binary in Node mode, so it reports an Electron version and has the Electron
- * main process as its parent. A plain `dsh` process on Node fails both checks.
+ * Mount the route, the tools, and the boot restore.
+ * @param ctx - Host cordis context.
+ * @param config - `{ resume?, requireApproval?, maxResumeSessions?, staggerMs?,
+ *   restartDelayMs?, planTtlMinutes?, continuationLanguage?, flushTimeoutMs?,
+ *   bootDelayMs?, maxTasks?, storeDir? }`.
  */
-function desktopHost() {
-  return process.platform === 'win32'
-    && typeof process.versions?.electron === 'string'
-    && Number.isInteger(process.ppid)
-    && process.ppid > 1
-}
-
-/** Append one line to the restart log. */
-function log(line) {
-  try {
-    mkdirSync(RUNTIME_DIR, { recursive: true })
-    appendFileSync(LOG_FILE, `${new Date().toISOString()} host: ${line}\n`, 'utf8')
-  } catch {
-    /* Diagnostics must never change the outcome. */
-  }
-}
-
-/** Wait between polls. */
-function sleep(milliseconds) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, milliseconds)
-  })
-}
-
-/** Whether one process id is still in the process table. */
-function alive(pid) {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return error.code !== 'ESRCH'
-  }
-}
-
-/** Path of the assistant script beside this module. */
-function assistantPath() {
-  return fileURLToPath(new URL('./relaunch.mjs', import.meta.url))
-}
-
-/**
- * Start the relaunch assistant once and wait until it proved it is running.
- * @param detached - whether to give the assistant its own process group.
- * @returns whether the assistant reported ready.
- */
-async function launchAssistant(detached) {
-  const shell = process.ppid
-  let child
-  try {
-    child = spawn(process.execPath, [
-      assistantPath(),
-      String(shell),
-      String(process.pid),
-      process.execPath,
-      LOG_FILE,
-      READY_MARKER,
-    ], {
-      detached,
-      stdio: 'ignore',
-      windowsHide: true,
-      cwd: dirname(process.execPath),
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-    })
-    child.on('error', (error) => log(`assistant spawn error detached=${String(detached)}: ${error?.code ?? error}`))
-    child.unref()
-  } catch (error) {
-    log(`assistant spawn threw detached=${String(detached)}: ${error?.code ?? error}`)
-    return false
-  }
-  const deadline = Date.now() + ASSISTANT_READY_TIMEOUT_MS
-  while (Date.now() < deadline) {
-    if (child.pid === undefined) {
-      log('assistant has no process id')
-      return false
-    }
-    if (existsSync(READY_MARKER)) {
-      log(`assistant ready pid=${String(child.pid)} detached=${String(detached)}`)
-      return true
-    }
-    if (!alive(child.pid)) {
-      log(`assistant exited before it was ready detached=${String(detached)}`)
-      return false
-    }
-    await sleep(80)
-  }
-  log(`assistant did not report ready detached=${String(detached)}`)
-  /* Leave no half-started assistant behind before the next attempt. */
-  try {
-    process.kill(child.pid, 'SIGKILL')
-  } catch {
-    /* already gone */
-  }
-  return false
-}
-
-/**
- * Start the relaunch assistant and wait until it proved it is running.
- *
- * A separate process group keeps it clear of the shell's own process group, and
- * a plain child is the fallback for the (rare) case where that form does not
- * start. The shell is only stopped when one of them reported ready.
- * @returns whether a relaunch path exists, so the shell may be stopped.
- */
-async function startAssistant() {
-  try {
-    mkdirSync(RUNTIME_DIR, { recursive: true })
-    rmSync(READY_MARKER, { force: true })
-  } catch {
-    /* A missing stale marker is the normal case. */
-  }
-  for (const detached of [true, false]) {
-    if (await launchAssistant(detached)) return true
-    try {
-      rmSync(READY_MARKER, { force: true })
-    } catch {
-      /* nothing to clean */
-    }
-  }
-  return false
-}
-
-/**
- * Stop the Electron shell and confirm it is gone.
- * @returns whether the shell was observed leaving the process table.
- */
-async function stopShell() {
-  const shell = process.ppid
-  try {
-    process.kill(shell, 'SIGKILL')
-    log(`shell ${String(shell)} signalled`)
-  } catch (error) {
-    log(`kill failed: ${error?.code ?? error}`)
-    return false
-  }
-  const deadline = Date.now() + SHELL_EXIT_TIMEOUT_MS
-  while (Date.now() < deadline) {
-    /* This Host stops itself when the shell's IPC channel disconnects, so the
-     * loop may never see the end of it; the assistant handles the rest. */
-    if (!alive(shell)) {
-      log('shell gone')
-      return true
-    }
-    await sleep(60)
-  }
-  return !alive(shell)
-}
-
-/**
- * Restart the application: prepare the relaunch, then stop the shell.
- * @returns the outcome reported to the page.
- */
-async function restart() {
-  const prepared = await startAssistant()
-  if (!prepared) return { ok: false, error: 'relaunch-unavailable' }
-  const stopped = await stopShell()
-  if (!stopped) return { ok: false, error: 'shell-alive' }
-  /* The shell is gone: this Host is already shutting down through its own
-   * disconnect handler. Keep a fallback for the case where it does not. */
-  setTimeout(() => process.exit(0), SELF_EXIT_DELAY_MS)
-  return { ok: true }
-}
-
-/**
- * Install the route that carries one restart request from the Client half.
- * @param ctx - plugin context.
- */
-export function apply(ctx) {
+export function apply(ctx, config = {}) {
+  const settings = resolveConfig(config)
+  const directory = storeDirectory(settings.storeDir)
+  const paths = runtimePaths()
+  const log = createLogger(paths.logFile)
   const supported = desktopHost()
+
+  /** One restart implementation for the page and the tools. */
+  const restart = (input) => requestRestart(ctx, { config: settings, directory, log, ...input })
 
   const reply = (res, status, payload) => {
     const body = JSON.stringify(payload)
@@ -238,17 +67,61 @@ export function apply(ctx) {
     }
   }
 
+  /** Read a bounded JSON request body. */
+  const readBody = (req, limit) => new Promise((resolve) => {
+    const chunks = []
+    let size = 0
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size <= limit) chunks.push(chunk)
+    })
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8').trim()
+      if (text === '') {
+        resolve({})
+        return
+      }
+      try {
+        const parsed = JSON.parse(text)
+        resolve(parsed !== null && typeof parsed === 'object' ? parsed : null)
+      } catch {
+        resolve(null)
+      }
+    })
+    req.on('error', () => resolve(null))
+  })
+
   const handler = async (req, res) => {
     /* The Client half reads this before offering the action: an outdated Host
-     * (for example one loaded before this file changed) must not be used. */
+     * (for example one loaded before this file changed) must not be used. The
+     * same document also feeds the post-restart notice. */
     if (req.method === 'GET') {
-      reply(res, 200, { ok: true, version: VERSION, supported, build: 'relaunch-assistant' })
+      let lastPlan = null
+      try {
+        lastPlan = recentPlanSummary(directory)
+      } catch {
+        lastPlan = null
+      }
+      reply(res, 200, {
+        ok: true,
+        version: VERSION,
+        supported,
+        capabilities: ['restart', 'resume', 'tasks'],
+        /* What the button should preselect, and how many task lines it may send. */
+        resumeDefault: settings.resume,
+        maxTasks: settings.maxTasks,
+        lastPlan,
+      })
       return
     }
     /* Diagnostic only: the Client half reports which language sources it sees,
      * so a wrong-label report can be answered with data instead of a guess. It
-     * changes no state. */
+     * changes no state, and it is header-gated like the restart itself. */
     if (req.method === 'PUT') {
+      if (req.headers[PROBE_HEADER] !== PROBE_VALUE) {
+        reply(res, 403, { ok: false, error: 'forbidden' })
+        return
+      }
       const chunks = []
       let size = 0
       req.on('data', (chunk) => {
@@ -257,8 +130,8 @@ export function apply(ctx) {
       })
       req.on('end', () => {
         try {
-          mkdirSync(RUNTIME_DIR, { recursive: true })
-          appendFileSync(join(RUNTIME_DIR, 'client-probe.log'), `${new Date().toISOString()} ${Buffer.concat(chunks).toString('utf8')}\n`, 'utf8')
+          mkdirSync(dirname(paths.probeLog), { recursive: true })
+          appendFileSync(paths.probeLog, `${new Date().toISOString()} ${Buffer.concat(chunks).toString('utf8')}\n`, 'utf8')
         } catch {
           /* diagnostics only */
         }
@@ -278,15 +151,45 @@ export function apply(ctx) {
       reply(res, 409, { ok: false, error: 'desktop-only' })
       return
     }
-    if (pending) {
-      reply(res, 202, { ok: true, status: 'restarting' })
+    const body = await readBody(req, 64 * 1024)
+    if (body === null) {
+      reply(res, 400, { ok: false, error: 'bad-request' })
       return
     }
-    pending = true
-    const outcome = await restart()
-    pending = false
-    if (outcome.ok) reply(res, 202, { ok: true, status: 'restarting' })
-    else reply(res, 500, { ok: false, error: outcome.error })
+    const mode = normalizeResumeMode(body.resume === undefined || body.resume === null ? settings.resume : body.resume)
+    if (mode === null) {
+      reply(res, 400, { ok: false, error: 'invalid-argument' })
+      return
+    }
+    const tasks = normalizeTasks(body.tasks, settings.maxTasks)
+    if (tasks.ok !== true) {
+      reply(res, 400, { ok: false, error: tasks.code })
+      return
+    }
+    const forced = settings.continuationLanguage
+    const language = forced === 'zh' || forced === 'en'
+      ? forced
+      : (typeof body.language === 'string' && body.language.toLowerCase().startsWith('en') ? 'en' : 'zh')
+    let outcome
+    try {
+      outcome = await restart({
+        origin: 'button',
+        mode,
+        tasks: tasks.tasks,
+        reason: typeof body.reason === 'string' ? body.reason : '',
+        language,
+      })
+    } catch (error) {
+      log(`button restart threw: ${String(error?.message ?? error)}`)
+      reply(res, 500, { ok: false, error: 'internal' })
+      return
+    }
+    if (outcome.ok === true) {
+      reply(res, 202, { ok: true, status: 'restarting', planId: outcome.plan.planId })
+      return
+    }
+    const status = outcome.code === 'desktop-only' || outcome.code === 'plan-busy' ? 409 : 500
+    reply(res, status, { ok: false, error: outcome.code })
   }
 
   ctx.effect(() => ctx.webServer.register({
@@ -294,6 +197,35 @@ export function apply(ctx) {
     path: ROUTE_PATH,
     handler,
   }), 'harness-restart: route')
-}
 
-export const inject = ['webServer']
+  ctx.effect(() => {
+    /* A rejected tool definition must not take the restart route down with it:
+     * the button stays useful even when an Agent tool cannot be registered. */
+    const disposers = []
+    try {
+      for (const tool of createTools({ ctx, config: settings, directory, log })) {
+        disposers.push(ctx.tools.register(tool))
+      }
+    } catch (error) {
+      log(`tool registration failed: ${String(error?.message ?? error)}`)
+      /* Do not leave a partial tool set behind. */
+      for (const dispose of disposers) {
+        try {
+          dispose()
+        } catch {
+          /* the registry already dropped it */
+        }
+      }
+      disposers.length = 0
+    }
+    return () => {
+      for (const dispose of disposers) dispose()
+    }
+  }, 'harness-restart: tools')
+
+  try {
+    scheduleBootRestore(ctx, settings, { directory, log })
+  } catch (error) {
+    log(`boot restore could not be armed: ${String(error?.message ?? error)}`)
+  }
+}

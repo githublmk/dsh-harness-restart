@@ -1,9 +1,9 @@
 {
   "name": "dsh-harness-restart",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
-  "description": "Restart control for the DeepSeek Harness Desktop caption band: restarts the app and its Host after a confirmation, from a button placed right after the panel nav's overflow launcher.",
+  "description": "Restart control and restart tool for the DeepSeek Harness Desktop: a caption-band button plus harness_restart*, a durable restart plan, and automatic continuation of the Sessions and tasks a restart interrupted.",
   "icon": "icon.svg",
   "license": "MIT",
   "author": {
@@ -27,6 +27,8 @@
     "cordis",
     "restart",
     "relaunch",
+    "resume",
+    "session",
     "titlebar",
     "windows"
   ],
@@ -39,6 +41,7 @@
     ".": "./index.js",
     "./client": "./client.js",
     "./relaunch": "./relaunch.mjs",
+    "./lib/*": "./lib/*.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg",
@@ -48,6 +51,8 @@
     "index.js",
     "client.js",
     "relaunch.mjs",
+    "lib",
+    "docs",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
@@ -57,8 +62,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "check": "node --check index.js && node --check client.js && node --check relaunch.mjs && node --check test/smoke-client.mjs",
-    "test": "node test/smoke-client.mjs"
+    "check": "node --check index.js && node --check client.js && node --check relaunch.mjs && node --check lib/config.js && node --check lib/plan.js && node --check lib/policy.js && node --check lib/relaunch-core.js && node --check lib/resume.js && node --check lib/restart.js && node --check lib/text.js && node --check lib/tools.js && node --check test/smoke-client.mjs && node --check test/plan.test.mjs && node --check test/plugin.test.mjs && node --check test/policy.test.mjs && node --check test/relaunch.test.mjs && node --check test/restart.test.mjs && node --check test/resume.test.mjs && node --check test/text.test.mjs && node --check test/tools.test.mjs",
+    "test": "node --test --test-timeout=30000 test/plan.test.mjs test/plugin.test.mjs test/policy.test.mjs test/relaunch.test.mjs test/restart.test.mjs test/resume.test.mjs test/text.test.mjs test/tools.test.mjs && node test/smoke-client.mjs"
   },
   "dsh": {
     "bundle": {

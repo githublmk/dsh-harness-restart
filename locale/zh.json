@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "重启 Harness",
-    "description": "在桌面标题栏菜单条的「更多」之后加一个重启按钮，确认后重启应用与 Host。"
+    "description": "在桌面标题栏菜单条的「更多」之后加一个重启入口：确认后重启应用与 Host，重启完成后自动继续被中断的会话，并可在重启前排好重启后任务；同时提供 harness_restart 等三个 Agent 工具。"
   }
 }

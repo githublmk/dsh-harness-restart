@@ -13,17 +13,23 @@
  * repeated instead of being trusted. Its stderr is kept next to the log, so a
  * silent exit can be explained.
  *
- * Arguments: <shell pid> <host pid> <application exe> <log file> <ready marker>
+ * Arguments: `<shell pid> <host pid> <application exe> <log file> <ready marker>
+ * [<plan dir> <plan id>]`. Empty plan arguments disable plan receipts. A pid
+ * that is not a positive integer is treated as unknown: the wait is skipped and
+ * the application is still launched.
  *
  * @module dsh-harness-restart/relaunch
  */
 import { execFileSync, spawn } from 'node:child_process'
 import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 
-const [shellArg, hostArg, appExe, logFile, marker] = process.argv.slice(2)
-const shell = Number(shellArg)
-const host = Number(hostArg)
+import { countApplicationProcesses, launchDecision, parseAssistantArgs } from './lib/relaunch-core.js'
+
+const { shell, host, appExe, logFile, marker, planDir, planId } = parseAssistantArgs(process.argv.slice(2))
+/** Where the fallback launch logs go; the Host always supplies a log file. */
+const logDir = logFile === '' ? tmpdir() : dirname(logFile)
 /** Upper bound on waiting for the two processes to disappear. */
 const EXIT_TIMEOUT_MS = 20000
 /** Pause after both processes are gone, so ports and process state settle. */
@@ -34,8 +40,16 @@ const LAUNCH_PROBE_MS = 5000
 const ATTEMPTS = 3
 const RETRY_DELAY_MS = 3000
 
+/* The log directory may not exist yet on a fresh machine. */
+try {
+  if (logFile !== '') mkdirSync(dirname(logFile), { recursive: true })
+} catch {
+  /* a lost log is not a lost restart */
+}
+
 /** Append one line to the restart log; never touches stdio. */
 function log(line) {
+  if (logFile === '') return
   try {
     appendFileSync(logFile, `${new Date().toISOString()} relauncher: ${line}\n`, 'utf8')
   } catch {
@@ -43,8 +57,25 @@ function log(line) {
   }
 }
 
+/**
+ * Record one relaunch milestone in the plan store, when this restart has one.
+ * The Host that wrote the plan can never report a later failure itself.
+ * @param {string} type - receipt type.
+ * @param {object} [extra] - additional receipt fields.
+ */
+function receipt(type, extra = {}) {
+  if (planDir === '' || planId === '') return
+  try {
+    mkdirSync(planDir, { recursive: true })
+    appendFileSync(join(planDir, 'history.jsonl'), `${JSON.stringify({ at: Date.now(), type, planId, ...extra })}\n`, 'utf8')
+  } catch {
+    /* diagnostics must never change the outcome */
+  }
+}
+
 /** Whether one process id is still in the process table. */
 function alive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
   try {
     process.kill(pid, 0)
     return true
@@ -56,34 +87,46 @@ function alive(pid) {
 /** Wait between polls. */
 function sleep(milliseconds) {
   return new Promise((resolve) => {
-    setTimeout(resolve, milliseconds)
+    const timer = setTimeout(resolve, milliseconds)
+    timer.unref?.()
   })
 }
 
-log(`started pid=${String(process.pid)} shell=${String(shell)} host=${String(host)}`)
+log(`started pid=${String(process.pid)} shell=${shell === null ? 'unknown' : String(shell)} host=${host === null ? 'unknown' : String(host)}`)
+if (shell === null || host === null) {
+  log('invalid pid arguments; the process wait is skipped')
+}
 
 /* Prove to the Host that this process is really running, so it only stops the
  * shell after a relaunch path exists. */
 try {
-  mkdirSync(dirname(marker), { recursive: true })
-  writeFileSync(marker, String(process.pid), 'utf8')
-  log('ready marker written')
+  if (marker !== '') {
+    mkdirSync(dirname(marker), { recursive: true })
+    writeFileSync(marker, String(process.pid), 'utf8')
+    log('ready marker written')
+  }
 } catch (error) {
   log(`ready marker failed: ${error?.code ?? error}`)
 }
 
-const deadline = Date.now() + EXIT_TIMEOUT_MS
-while (Date.now() < deadline) {
-  if (!alive(shell) && !alive(host)) break
-  await sleep(100)
+if (shell !== null && host !== null) {
+  const deadline = Date.now() + EXIT_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    if (!alive(shell) && !alive(host)) break
+    await sleep(100)
+  }
 }
 
-if (alive(shell)) {
+if (shell !== null && alive(shell)) {
   log('shell is still running; not starting a second instance')
+  receipt('relaunch-abandoned', { reason: 'shell-alive' })
   process.exit(0)
 }
 
-log('shell and host are gone')
+const hostAlive = host !== null && alive(host)
+log(hostAlive ? 'shell is gone; the old host is still leaving' : 'shell and host are gone')
+if (!hostAlive) receipt('shell-stopped')
+
 await sleep(SETTLE_MS)
 
 const environment = { ...process.env }
@@ -113,16 +156,16 @@ function applicationProcesses() {
   /* The image name comes from the executable that is running this bundle, so a
    * moved or renamed installation keeps working. */
   const image = basename(appExe)
-  const count = (text) => String(text).split(/\r?\n/u).filter((line) => line.toLowerCase().includes(image.toLowerCase())).length
   try {
-    return count(execFileSync('tasklist.exe', [
+    const text = execFileSync('tasklist.exe', [
       '/FI', `IMAGENAME eq ${image}`,
       '/FO', 'CSV',
       '/NH',
-    ], { encoding: 'utf8', windowsHide: true, timeout: 8000 }))
+    ], { encoding: 'utf8', windowsHide: true, timeout: 8000 })
+    return countApplicationProcesses(text, image)
   } catch (error) {
     /* tasklist can exit non-zero while still printing the table. */
-    if (typeof error?.stdout === 'string') return count(error.stdout)
+    if (typeof error?.stdout === 'string') return countApplicationProcesses(error.stdout, image)
     return -1
   }
 }
@@ -138,20 +181,33 @@ async function launchThroughShell() {
   const before = applicationProcesses()
   log(`shell launch: application processes before=${String(before)}`)
   try {
-    spawn('explorer.exe', [appExe], { stdio: 'ignore', windowsHide: true }).unref()
+    const child = spawn('explorer.exe', [appExe], { stdio: 'ignore', windowsHide: true })
+    child.on('error', (error) => log(`explorer spawn error: ${error?.code ?? error}`))
+    child.unref()
   } catch (error) {
     log(`shell launch threw: ${error?.code ?? error}`)
     return false
   }
   for (let waited = 0; waited < 24000; waited += 1500) {
     await sleep(1500)
-    const count = applicationProcesses()
-    if (count > Math.max(before, 0)) {
+    const after = applicationProcesses()
+    const decision = launchDecision({ before, after })
+    if (decision === 'unknown') {
+      /* Reading the table failed (an antivirus, a locked-down shell). Starting
+       * another instance would be worse than trusting the launch. */
+      log('shell launch: the process table is unreadable; assuming the application started')
+      return true
+    }
+    if (decision === 'launched') {
       /* One sighting is not enough: an instance that quits right away also
        * shows up for a moment. */
       await sleep(4000)
       const again = applicationProcesses()
-      if (again > Math.max(before, 0)) {
+      if (again < 0) {
+        log(`launched through shell (the process table became unreadable); waited ${String(waited + 5500)}ms`)
+        return true
+      }
+      if (again >= after) {
         log(`launched through shell; application processes=${String(again)} after ${String(waited + 5500)}ms`)
         return true
       }
@@ -169,8 +225,8 @@ for (let attempt = 1; attempt <= ATTEMPTS && !launched; attempt += 1) {
   /* A plain child first: DETACHED_PROCESS makes some executables exit at once,
    * so a separate process group is only the last resort. */
   const detached = attempt === ATTEMPTS
-  const outPath = join(dirname(logFile), `launch-${String(attempt)}.out.log`)
-  const errPath = join(dirname(logFile), `launch-${String(attempt)}.err.log`)
+  const outPath = join(logDir, `launch-${String(attempt)}.out.log`)
+  const errPath = join(logDir, `launch-${String(attempt)}.err.log`)
   let out = -1
   let err = -1
   let child
@@ -208,4 +264,5 @@ for (let attempt = 1; attempt <= ATTEMPTS && !launched; attempt += 1) {
 }
 
 log(launched ? 'done' : 'gave up')
-process.exit(0)
+receipt(launched ? 'relaunch-ok' : 'relaunch-failed', launched ? {} : { reason: 'launch-failed' })
+process.exit(launched ? 0 : 1)

@@ -1,8 +1,18 @@
 # dsh-harness-restart
 
-给 DeepSeek Harness 桌面端标题栏菜单条加一个 **重启** 按钮 —— 位置就在全局面板导航的「更多」后面，点一下（二次确认）重启「应用与 Host」。
+给 DeepSeek Harness 桌面端加一个 **重启** 按钮和一个 **重启工具** —— 点一下（二次确认）重启「应用与 Host」，重启完成后**被中断的会话会自动继续**，还可以在重启前排好重启后要执行的任务。
 
-> 桌面端「应用」菜单是 Electron 原生菜单，打包版里没有「重启应用与 Host」这一项（只有开发版有），插件也无法往原生菜单插项。这个 bundle 走另一条路，在菜单条上放一个自带的重启入口。
+> 桌面端「应用」菜单是 Electron 原生菜单，打包版里没有「重启应用与 Host」这一项（只有开发版有），插件也无法往原生菜单插项。这个 bundle 走另一条路：在标题栏菜单条上放一个自带的重启入口，同时把同一套重启能力做成 Agent 工具。
+
+## 功能
+
+- **标题栏按钮**：位置紧跟全局面板导航的「更多」启动器；确认气泡里可以
+  - 勾选「重启后继续被中断的会话」（默认勾选）；
+  - 填写「重启后任务」（每行一条，可选）。
+- **Agent 工具**：`harness_restart` / `harness_restart_status` / `harness_restart_cancel`，让模型自己发起重启并描述重启后要做什么。
+- **自动续作**：重启瞬间正处在回合中的所有根会话，开机后各自收到一条续作指令，从日志里的最后一个检查点继续，**不重做已完成的工作**。
+- **重启后任务**：默认各开一个新会话（可指定 cwd / 预设 / 标题 / 执行时间），也可以发到指定会话。
+- **可观测**：计划、逐条回执、失败原因都在磁盘上；重启完成后的页面会提示「已恢复 N 个会话，启动 M 个任务」。
 
 ## 界面
 
@@ -11,11 +21,52 @@
 - **交互**：点一下弹出确认气泡（`Esc` 或点空白关闭）：
 
   > 重启应用与 Host？
-  > 正在进行的任务会被中断，界面会在几秒后自动恢复。
+  > 正在进行的任务会被中断；重启完成后，被中断的会话会自动继续。
+  > ☑ 重启后继续被中断的会话
+  > 重启后任务（可选，每行一条）
   > 　　　　　　　　　　　　　[取消] [重启]
 
-  确认后按钮变成「正在重启…」。请求被拒时气泡重新打开并说明原因。
-- **文案**：中英双语，跟随应用语言。
+  确认后按钮变成「正在重启…」。请求被拒时气泡重新打开并说明原因；旧 Host 或不支持的环境只给「取消」。
+- **文案**：中英双语。判定顺序是 locale 服务 → 文档 `lang` → `navigator.language`，任一中文提示源优先（细节见 [docs/mechanism.md](docs/mechanism.md#语言解析)）。
+
+## 工具
+
+三个工具在 Host 根的 tools 作用域注册，profile 级的一行 patch 即对全部 Agent 可见。
+
+### `harness_restart`
+
+| 参数 | 说明 |
+| --- | --- |
+| `reason` | 为什么要重启；写进计划、续作指令和日志 |
+| `resume` | `interrupted`（默认，重启瞬间在回合中的所有根会话）／`self`（只本会话）／`none` |
+| `sessions` | 显式恢复的会话 id 列表（给定时覆盖 `resume`） |
+| `continuation` | 给被恢复会话的额外提示（拼进续作指令） |
+| `tasks[]` | `{ prompt, title?, newSession?, sessionId?, cwd?, agentPreset?, at? }`；重启后执行 |
+| `dryRun` | `true` 只回报计划，不重启 |
+
+行为要点：
+
+- 调用前弹 **审批卡**（`ctx.approval`，可用 `requireApproval: false` 关掉）。用户拒绝/取消则不重启；没有可用应答者时也**不会**重启（返回 `approval-unavailable`，提示用户点标题栏按钮）。只有**根会话**能发起（子智能体调用返回 `nested-agent`）。
+- 审批通过后：写计划 → 启动 `relaunch.mjs` 并等 ready 标记 → 返回工具结果 → **约 1.5 秒后** flush 活会话并停壳。延迟是为了让这次工具结果先落进会话日志。
+- 返回 `{ ok, planId, restarting, restartInMs, willResume[], tasks[], note }`；失败返回 `{ ok:false, code, message }`，常见 `desktop-only` / `plan-busy` / `relaunch-unavailable` / `shell-alive` / `not-approved`。
+
+### `harness_restart_status`
+
+读当前计划状态、最近一次重启的恢复/任务数量、仍未完成的条目。适合回答「上次重启恢复得怎么样」。
+
+### `harness_restart_cancel`
+
+删掉还没进入停壳阶段（`armed`）的计划；已开始执行的不能取消。
+
+## 重启后自动续作
+
+1. 重启前把「重启瞬间正在回合中的根会话」写进计划（`agents.roots()` + `turnBoundaryOf(session).openTurnStartSeq`，子代理会话和已正常结束/被用户中止的回合不会被选中）。
+2. 新 Host 启动约 1.5 秒后读计划，对每个会话调用
+   `sessionController.prompt({ sessionId, requestId: 'restart-<planId>-<session>', mode:'queue', content:[续作指令] })`。
+   这条 API 自己负责恢复冷会话、重建 Agent、写入 user 消息并 `followup`。
+3. 续作指令明确写着：先复述进度 → 从检查点继续 → 已完成的不重做 → 除非用户明确要求不要再调用 `harness_restart`。
+4. 投递是**幂等**的：每条目的 `requestId` 固定，`prompt` 内部按它去重；计划逐条落盘，中途再挂也只补没投的。
+5. 上限 `maxResumeSessions`（默认 8，显式 `sessions` 也受这个上限约束）、间隔 `staggerMs`（默认 800ms）、计划 `planTtlMinutes`（默认 60 分钟）。
 
 ## 它是怎么重启的
 
@@ -23,14 +74,11 @@
 
 Host 是桌面壳（Electron main）的子进程，**壳一死 Host 就被 `disconnect` 事件带走**，所以 Host 不可能「杀壳之后再拉起应用」。真正的重启由 `relaunch.mjs` 完成——它在杀壳**之前**就启动（脱离父进程、无管道），等壳和 Host 都消失后，用**双击等价的方式**（`explorer.exe <应用 exe>`）把应用拉起来，并用进程表确认它真的活着；失败会重试，仍失败就退回直接启动。
 
-安全性质：**拿不到助手的 ready 标记就绝不杀壳**。最差情况是「按钮报错、应用原样」，不会出现「壳被杀掉、应用起不来」。
-
-应用的可执行文件路径取自运行中 Host 的 `process.execPath`，没有写死安装目录；`tasklist` 里的镜像名也从它取 `basename`。
+安全性质：**拿不到助手的 ready 标记就绝不杀壳**；停壳失败会把计划标成 `aborted` 并写回执，下次正常启动**不会**被意外续作。应用 exe 取自运行中 Host 的 `process.execPath`，不写死安装目录。
 
 ## 安装
 
 ```powershell
-# 在本机 profile 里安装（会 link 当前目录）
 plugin_manager install_bundle D:\path\to\dsh-harness-restart
 ```
 
@@ -45,32 +93,61 @@ plugin_manager install_bundle D:\path\to\dsh-harness-restart
 
 装完**重开一次应用**（Host 侧代码和客户端 bundle 都在应用启动时加载）。
 
-## 日志
+## 配置
 
-都在 `%TEMP%\dsh-harness-restart\`：
+`config` 全部可省略：
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `resume` | `interrupted` | 按钮路径的默认恢复策略；打开气泡时按它预选「继续会话」开关（工具以参数为准） |
+| `requireApproval` | `true` | 工具是否走 `ctx.approval` 审批卡 |
+| `maxResumeSessions` | `8` | 单次重启最多恢复多少个会话 |
+| `staggerMs` | `800` | 两条续作之间的间隔 |
+| `restartDelayMs` | `1500` | 工具返回后多久停壳 |
+| `planTtlMinutes` | `60` | 未执行的计划多久后作废 |
+| `continuationLanguage` | `auto` | `auto` 跟随对话语言；`zh` / `en` 强制 |
+| `flushTimeoutMs` | `3000` | 停壳前 flush 活会话的预算 |
+| `bootDelayMs` | `1500` | 开机后多久开始恢复 |
+| `maxTasks` | `8` | 单次重启最多排多少个任务（也决定气泡里最多接受几行） |
+| `storeDir` | `null` | 覆盖计划目录（默认 `$DSH_HOME/harness-restart`） |
+
+## 数据与日志
+
+**计划与回执**：`$DSH_HOME\harness-restart\`
 
 | 文件 | 内容 |
 | --- | --- |
-| `restart.log` | 一次重启的完整时序：`host: assistant ready` → `host: shell gone` → `relauncher: shell launch: application processes before=0` → `launched through shell; application processes=6` |
-| `client-probe.log` | 客户端挂载时上报的语言来源（`active` / `documentLang` / `navigatorLanguage`），排查文案问题用 |
+| `plan.json` | 当前/最近一次重启计划（原子写：tmp + fsync + rename；损坏时改名 `plan.json.corrupt-*`） |
+| `history.jsonl` | 逐条回执：`plan` / `resume` / `task` / `plan-done` / `plan-aborted` / `relaunch-*` |
+| `restart.lock` | 单次重启互斥锁（持有者进程已死则可被新 Host 接管） |
+
+**时序日志**：`%TEMP%\dsh-harness-restart\`
+
+| 文件 | 内容 |
+| --- | --- |
+| `restart.log` | 一次重启的完整时序：`assistant ready` → `shell gone` → `flushed N session(s)` |
+| `client-probe.log` | 客户端挂载时上报的语言来源，排查文案问题用 |
 | `launch-N.out.log` / `launch-N.err.log` | 直接启动尝试的 stdout/stderr（走 explorer 路径时不会产生） |
 
 ## 限制与已知问题
 
-- **仅 Windows 桌面端**。其余环境路由返回 `409 desktop-only`。
-- 重启是「停壳 + 拉起」，不走壳的优雅退出流程：**进行中的回合会被中断**（会话日志保留，重开后仍在）。
+- **仅 Windows 桌面端**。其余环境工具返回 `desktop-only`，路由返回 `409 desktop-only`。
+- 重启是「停壳 + 拉起」，不走壳的优雅退出流程：**进行中的回合会被中断**，然后由续作机制接着做；被中断的那一步不会原地续跑（harness 的崩溃恢复只补齐回合边界）。
+- 只有写入 `restarting` 的计划才会被执行：助手就绪之前进程就挂掉留下的 `armed` 计划，下次启动会作废（回执 `plan-abandoned`），不会被补跑。
+- 停壳前会 flush 活会话；flush 超时只记日志、不会无限等待（计划本身仍然覆盖这次中断）。
 - 客户端 bundle 是 Host 激活时的内存快照，改 `client.js` **必须重开应用**，刷新页面不够。
-- 自动拉起在个别环境里可能失败（进程起来、窗口不出现）。日志里能看出来，兜底就是手动双击启动；后续计划改走桌面壳自带的 `app.relaunch()` 恢复路径。
-- 客户端会先 `GET` 同一路由校验 Host 版本，旧 Host（例如升级前加载的）会拒绝执行，避免用不匹配的两半走重启。
+- 自动拉起在个别环境里可能失败（进程起来、窗口不出现）。日志里能看出来，兜底就是手动双击启动；计划在 TTL 内仍会在下次启动时执行。
+- 客户端在发请求前先读 `GET` 路由校验 Host 版本；旧 Host（或非桌面环境）不执行，避免两半不匹配。
+- 续作会真的发起模型请求（这是目的），一次重启最多恢复 `maxResumeSessions` 个会话；如果只想重启不想续作，用 `resume: 'none'`。
 
 ## 开发
 
 ```powershell
-npm run check   # node --check 三个入口
-npm test        # 无头 React 替身跑客户端：注册、文案、版本门禁、POST、旧版本拒绝
+npm run check   # node --check 全部入口与 lib
+npm test        # 计划/策略/文案/恢复引擎单测 + 客户端无头冒烟
 ```
 
-`test/smoke-client.mjs` 用最小 React 替身和假标题栏 DOM 跑真实的 `client.js`，不需要浏览器。
+`test/smoke-client.mjs` 用最小 React 替身和假标题栏 DOM 跑真实的 `client.js`；`lib/*` 的单测用真实文件系统（临时目录）与假 `sessionController`，不需要 Harness。
 
 ## License
 

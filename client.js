@@ -9,7 +9,9 @@
  *
  * The control asks the Host for its version before offering the action, so an
  * outdated Host half (one loaded before this file changed) is never used: that
- * combination would stop the shell without a working relaunch path.
+ * combination would stop the shell without a working relaunch path. The same
+ * probe reports the last finished restart, which the control shows once the
+ * page is back.
  *
  * @module dsh-harness-restart
  */
@@ -21,7 +23,7 @@ window.__ModuleLoader__.load({
     const { useCallback, useEffect, useState } = React
 
     /** Version the Host half must report before the action is offered. */
-    const VERSION = '0.3.0'
+    const VERSION = '0.4.0'
     /** Same-origin route the Host half answers (forwarded by the Desktop shell). */
     const ROUTE = '/dsh-harness-restart/restart'
     /** Height of the control, matching one caption panel row. */
@@ -30,30 +32,56 @@ window.__ModuleLoader__.load({
     const WINDOW_CONTROLS_RESERVE = 168
     /** Locale namespace the strings are registered under. */
     const NS = 'harness-restart'
+    /** A finished plan older than this is history, not a notification. */
+    const NOTICE_TTL_MS = 10 * 60 * 1000
+    /** How long the post-restart notice stays on screen. */
+    const NOTICE_HIDE_MS = 15000
+    /** If the page is still alive this long after a request, the restart failed. */
+    const RESTART_WATCHDOG_MS = 20000
+    /** Upper bound on task lines accepted from the popover. */
+    const MAX_TASKS = 8
 
     /** Visible text, per app language; the Client locale service selects one. */
     const TEXT = {
       'zh-CN': {
         label: '重启',
-        tooltip: '重启应用与 Host',
+        tooltip: '重启应用与 Host（重启后可继续被中断的会话）',
         title: '重启应用与 Host？',
-        body: '正在进行的任务会被中断，界面会在几秒后自动恢复。',
+        body: '正在进行的任务会被中断；重启完成后，被中断的会话会自动继续。',
+        bodyNoResume: '正在进行的任务会被中断；本次重启不会恢复被中断的会话。',
+        resumeLabel: '重启后继续被中断的会话',
+        tasksLabel: '重启后任务（可选，每行一条）',
+        tasksPlaceholder: '例如：跑一遍 npm test 并汇报失败摘要',
         cancel: '取消',
         confirm: '重启',
         busy: '正在重启…',
         failed: '重启请求没有被接受，请稍后再试。',
         outdated: '当前 Host 还是旧版本，先重开一次应用再试。',
+        unsupported: '当前环境不支持自动重启（仅桌面端）。',
+        stalled: '重启没有在预期时间内发生，应用仍在运行；详情见 %TEMP%\\dsh-harness-restart\\restart.log。',
+        conflict: '已有一次重启正在进行，稍等它完成（界面会在几秒内重启）。',
+        notice: '重启完成：已恢复 {resumed} 个会话，启动 {tasks} 个任务',
+        noticeFailed: '上次重启有未完成的条目（已恢复 {resumed} 个会话，启动 {tasks} 个任务）',
       },
       en: {
         label: 'Restart',
-        tooltip: 'Restart the app and Host',
+        tooltip: 'Restart the app and Host (interrupted Sessions continue afterwards)',
         title: 'Restart the app and Host?',
-        body: 'Running tasks are interrupted; the window comes back in a few seconds.',
+        body: 'Running tasks are interrupted; interrupted Sessions continue automatically after the restart.',
+        bodyNoResume: 'Running tasks are interrupted; this restart will not resume interrupted Sessions.',
+        resumeLabel: 'Continue interrupted Sessions after the restart',
+        tasksLabel: 'Post-restart tasks (optional, one per line)',
+        tasksPlaceholder: 'For example: run npm test and report the failing summary',
         cancel: 'Cancel',
         confirm: 'Restart',
         busy: 'Restarting…',
         failed: 'The restart request was not accepted. Try again.',
         outdated: 'The running Host is an older version. Restart the app once first.',
+        unsupported: 'Automatic restart is available only in the Desktop app.',
+        stalled: 'The restart did not happen in time and the app is still running; see %TEMP%\\dsh-harness-restart\\restart.log.',
+        conflict: 'A restart is already in flight; wait for it to finish (the window comes back in a few seconds).',
+        notice: 'Restart finished: {resumed} Session(s) resumed, {tasks} task(s) started',
+        noticeFailed: 'The last restart left unfinished entries ({resumed} resumed, {tasks} task(s) started)',
       },
     }
 
@@ -104,6 +132,33 @@ window.__ModuleLoader__.load({
       if (hints.some((value) => value.startsWith('zh'))) return 'zh-CN'
       if (hints.some((value) => value.startsWith('en'))) return 'en'
       return 'zh-CN'
+    }
+
+    /** Fill `{name}` placeholders in one localized template. */
+    function formatTemplate(template, values) {
+      return String(template).replace(/\{(\w+)\}/gu, (match, key) => (
+        Object.prototype.hasOwnProperty.call(values, key) ? String(values[key]) : match
+      ))
+    }
+
+    /**
+     * Schedule work through the page's timer, when it has one. The headless
+     * smoke harness has no `window.setTimeout`, and no timer is better than a
+     * Node timer that would keep that process alive.
+     */
+    function later(callback, milliseconds) {
+      if (typeof window !== 'undefined' && typeof window.setTimeout === 'function') {
+        return window.setTimeout(callback, milliseconds)
+      }
+      return undefined
+    }
+
+    /** Cancel a timer created by {@link later}. */
+    function cancelLater(handle) {
+      if (handle === undefined) return
+      if (typeof window !== 'undefined' && typeof window.clearTimeout === 'function') {
+        window.clearTimeout(handle)
+      }
     }
 
     /** Register the strings with the Client locale service; never fatal. */
@@ -172,7 +227,7 @@ window.__ModuleLoader__.load({
      * launcher while the sidebar collapses, the locale changes, or the window
      * resizes. Hidden when there is no room left of the window controls.
      */
-    function useAnchor() {
+    function useAnchor(open) {
       const [anchor, setAnchor] = useState(null)
       useEffect(() => {
         if (typeof document === 'undefined') return undefined
@@ -180,10 +235,13 @@ window.__ModuleLoader__.load({
         const measure = () => {
           const next = captionAnchor()
           const room = next !== null && next.left + 104 <= window.innerWidth - WINDOW_CONTROLS_RESERVE
-          const state = next === null || !room ? '' : `${next.left},${next.top}`
-          if (state === previous) return
-          previous = state
-          setAnchor(state === '' ? null : next)
+          const seat = next === null || !room ? '' : `${next.left},${next.top}`
+          if (seat === previous) return
+          /* Keep the control where it is while its popover is open: losing the
+           * seat for one remeasure must not unmount the dialog under the user. */
+          if (seat === '' && open) return
+          previous = seat
+          setAnchor(seat === '' ? null : next)
         }
         measure()
         const timer = window.setInterval(measure, 1000)
@@ -192,7 +250,7 @@ window.__ModuleLoader__.load({
           window.clearInterval(timer)
           window.removeEventListener('resize', measure)
         }
-      }, [])
+      }, [open])
       return anchor
     }
 
@@ -236,13 +294,26 @@ window.__ModuleLoader__.load({
      * @param ctx - the Client root context carrying the locale service.
      */
     function createControl(ctx) {
+      /** One submission at a time, even when two clicks land in one frame. */
+      let submitting = false
+      /** The stalled watchdog of the current attempt. */
+      let watchdog
+
       return function RestartControl() {
         const text = useText(ctx)
-        const anchor = useAnchor()
         const [open, setOpen] = useState(false)
+        const anchor = useAnchor(open)
         const [busy, setBusy] = useState(false)
         const [error, setError] = useState('')
         const [hover, setHover] = useState(false)
+        const [resume, setResume] = useState(true)
+        const [tasksText, setTasksText] = useState('')
+        const [notice, setNotice] = useState(null)
+        const [maxTasks, setMaxTasks] = useState(MAX_TASKS)
+
+        useEffect(() => () => {
+          cancelLater(watchdog)
+        }, [])
 
         useEffect(() => {
           if (!open) return undefined
@@ -285,7 +356,7 @@ window.__ModuleLoader__.load({
             }
             fetch(ROUTE, {
               method: 'PUT',
-              headers: { 'content-type': 'application/json' },
+              headers: { 'content-type': 'application/json', 'x-dsh-restart-probe': '1' },
               body: JSON.stringify(payload),
             }).catch(() => {})
           } catch {
@@ -293,34 +364,96 @@ window.__ModuleLoader__.load({
           }
         }, [])
 
-        /** Read the Host version before offering the action. */
+        /* The page is freshly loaded after a restart: if the Host finished a
+         * plan a moment ago, say what it did. */
+        useEffect(() => {
+          let mounted = true
+          let timer
+          ;(async () => {
+            try {
+              const response = await fetch(ROUTE, { headers: { accept: 'application/json' } })
+              const info = await response.json()
+              if (!mounted) return
+              const last = info?.lastPlan
+              if (last === null || typeof last !== 'object' || typeof last.finishedAt !== 'number') return
+              if (Date.now() - last.finishedAt > NOTICE_TTL_MS) return
+              setNotice({
+                ok: last.ok !== false,
+                resumed: Number.isFinite(last.resumed) ? last.resumed : 0,
+                tasks: Number.isFinite(last.tasks) ? last.tasks : 0,
+              })
+              timer = later(() => {
+                if (mounted) setNotice(null)
+              }, NOTICE_HIDE_MS)
+            } catch {
+              /* the notice is optional */
+            }
+          })()
+          return () => {
+            mounted = false
+            cancelLater(timer)
+          }
+        }, [])
+
+        /** Probe the Host: version, support, and the button's own defaults. */
         const probe = useCallback(async () => {
           try {
             const response = await fetch(ROUTE, { headers: { accept: 'application/json' } })
+            if (!response.ok) return { error: 'failed' }
             const info = await response.json()
-            return response.ok && info?.version === VERSION
+            if (info?.supported === false) return { error: 'unsupported' }
+            if (info?.version !== VERSION) return { error: 'outdated' }
+            return { error: '', info }
           } catch {
-            return false
+            return { error: 'failed' }
           }
         }, [])
 
         const confirm = useCallback(async () => {
+          if (submitting) return
+          submitting = true
           setOpen(false)
           setBusy(true)
           setError('')
+          setNotice(null)
+          cancelLater(watchdog)
+          /* Armed before the request: a hung POST must not leave the control
+           * busy forever with no popover and no way to retry. */
+          watchdog = later(() => {
+            setBusy(false)
+            setError('stalled')
+            setOpen(true)
+            submitting = false
+          }, RESTART_WATCHDOG_MS)
+          const tasks = tasksText
+            .split(/\r?\n/u)
+            .map((line) => line.trim())
+            .filter((line) => line !== '')
+            .slice(0, maxTasks)
+            .map((prompt) => ({ prompt }))
           try {
             const response = await fetch(ROUTE, {
               method: 'POST',
               headers: { 'x-dsh-restart-action': 'restart', 'content-type': 'application/json' },
-              body: '{}',
+              body: JSON.stringify({ resume: resume ? 'interrupted' : 'none', tasks, language: language(ctx) }),
             })
-            if (!response.ok) throw new Error(String(response.status))
+            if (!response.ok) {
+              cancelLater(watchdog)
+              setBusy(false)
+              setError(response.status === 409 ? 'conflict' : 'failed')
+              setOpen(true)
+              submitting = false
+            }
+            /* On success the watchdog stays armed: if the app never restarts, it
+             * clears the busy state instead of leaving a dead control behind. */
           } catch {
+            cancelLater(watchdog)
             setBusy(false)
             setError('failed')
             setOpen(true)
+            submitting = false
           }
-        }, [])
+        }, [resume, tasksText, maxTasks])
 
         const toggle = useCallback(async () => {
           if (busy) return
@@ -329,20 +462,24 @@ window.__ModuleLoader__.load({
             return
           }
           setError('')
-          const current = await probe()
-          if (!current) {
-            setError('outdated')
+          const result = await probe()
+          if (result.error !== '') {
+            setError(result.error)
             setOpen(true)
             return
           }
+          const info = result.info ?? {}
+          /* The profile's resume policy is the button's initial state. */
+          if (typeof info.resumeDefault === 'string') setResume(info.resumeDefault !== 'none')
+          if (Number.isInteger(info.maxTasks) && info.maxTasks > 0) setMaxTasks(info.maxTasks)
           setOpen(true)
         }, [busy, open, probe])
 
         if (anchor === null) return null
 
-        const popoverWidth = 320
+        const popoverWidth = 360
         const popoverLeft = Math.max(8, Math.min(anchor.left, window.innerWidth - popoverWidth - 12))
-        const outdated = error === 'outdated'
+        const blocked = error === 'outdated' || error === 'unsupported'
 
         const backdrop = open
           ? h('div', {
@@ -423,20 +560,61 @@ window.__ModuleLoader__.load({
             style: {
               color: 'var(--dsw-alias-label-secondary)',
               lineHeight: 1.6,
-              marginBottom: error === '' ? 12 : 8,
+              marginBottom: 10,
             },
-          }, text('body')),
+          }, text(resume ? 'body' : 'bodyNoResume')),
+          h('label', {
+            key: 'resume',
+            style: {
+              display: 'flex', alignItems: 'center', gap: 8,
+              marginBottom: 10, cursor: 'pointer',
+              color: 'var(--dsw-alias-label-primary)',
+            },
+          },
+          h('input', {
+            type: 'checkbox',
+            checked: resume,
+            onChange: () => setResume(!resume),
+            style: { margin: 0 },
+          }),
+          h('span', { key: 'text' }, text('resumeLabel'))),
+          h('div', {
+            key: 'tasks',
+            style: { marginBottom: error === '' ? 12 : 8 },
+          },
+          h('div', {
+            key: 'label',
+            style: { color: 'var(--dsw-alias-label-secondary)', marginBottom: 4 },
+          }, text('tasksLabel')),
+          h('textarea', {
+            value: tasksText,
+            onChange: (event) => setTasksText(event?.target?.value ?? ''),
+            placeholder: text('tasksPlaceholder'),
+            rows: 2,
+            style: {
+              width: '100%',
+              boxSizing: 'border-box',
+              resize: 'vertical',
+              padding: '6px 8px',
+              borderRadius: 6,
+              border: '1px solid var(--dsw-alias-border-l1)',
+              background: 'transparent',
+              color: 'var(--dsw-alias-label-primary)',
+              font: 'inherit',
+              fontSize: 13,
+            },
+          })),
           error === ''
             ? null
             : h('div', {
               key: 'error',
               style: { color: 'var(--dsw-alias-state-error-primary)', marginBottom: 12 },
-            }, text(outdated ? 'outdated' : 'failed')),
+            }, text(error)),
           h('div', {
             key: 'actions',
             style: { display: 'flex', justifyContent: 'flex-end', gap: 8 },
           },
-          outdated
+          blocked
             ? actionButton('close', text('cancel'), false, () => setOpen(false))
             : [
               actionButton('cancel', text('cancel'), false, () => setOpen(false)),
@@ -446,7 +624,35 @@ window.__ModuleLoader__.load({
           )
           : null
 
-        return h(React.Fragment, null, backdrop, control, popover)
+        const noticeNode = notice === null
+          ? null
+          : h('div', {
+            key: 'notice',
+            role: 'status',
+            onClick: () => setNotice(null),
+            style: {
+              position: 'fixed',
+              left: anchor.left,
+              top: anchor.top + CONTROL_HEIGHT + 6,
+              maxWidth: 380,
+              padding: '4px 10px',
+              borderRadius: 6,
+              background: 'var(--dsw-alias-bg-overlay)',
+              border: '1px solid var(--dsw-alias-border-l1)',
+              color: 'var(--dsw-alias-label-secondary)',
+              fontSize: 12,
+              lineHeight: 1.5,
+              zIndex: 1300,
+              pointerEvents: 'auto',
+              cursor: 'pointer',
+              WebkitAppRegion: 'no-drag',
+            },
+          }, formatTemplate(notice.ok ? text('notice') : text('noticeFailed'), {
+            resumed: notice.resumed,
+            tasks: notice.tasks,
+          }))
+
+        return h(React.Fragment, null, backdrop, control, popover, noticeNode)
       }
     }
 

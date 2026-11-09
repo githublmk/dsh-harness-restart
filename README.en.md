@@ -1,25 +1,51 @@
 # dsh-harness-restart
 
-A **Restart** control for the DeepSeek Harness desktop caption band, right after the global panel nav's overflow ("更多"), restarting the app and its Host after a confirmation.
+A **Restart** control and a **restart tool** for the DeepSeek Harness Desktop: restart the app and its Host after a confirmation, then have the interrupted Sessions continue automatically, with optional tasks queued for after the restart.
 
-> The Desktop Application menu is a native Electron menu. Its "Restart App and Host" item is gated behind `development` in `applicationItems()`, and a Cordis plugin cannot add items to a native menu. This bundle therefore puts its own restart entry on the same menu bar.
+> The Desktop Application menu is a native Electron menu. Its "Restart App and Host" item is gated behind `development` in `applicationItems()`, and a Cordis plugin cannot add items to a native menu. This bundle therefore puts its own restart entry on the same menu bar and exposes the same capability to Agents as tools.
 
 ## What you get
 
-- Only in the Desktop app: the panel nav must sit in the caption band (the `dsh-panel-titlebar` layout), or `[data-windows-menu]` must be at the top. A plain browser page never shows it.
+- **Caption-band button** — right after the panel nav's overflow ("更多"). Its confirmation popover offers "Continue interrupted Sessions after the restart" (on by default) and a "Post-restart tasks" box, one task per line.
+- **Agent tools** — `harness_restart`, `harness_restart_status`, `harness_restart_cancel`.
+- **Automatic continuation** — every root Session that was inside a turn at the moment of the restart receives one continuation instruction afterwards and continues from its last checkpoint without redoing finished work.
+- **Post-restart tasks** — each runs in a new Session (cwd / preset / title / `at` configurable) or in a named Session.
+- **Observability** — the plan, per-entry receipts, and failure reasons live on disk; the page reports "N Session(s) resumed, M task(s) started" once it is back.
+
+## The button
+
+- Desktop only: the panel nav must sit in the caption band (the `dsh-panel-titlebar` layout), or `[data-windows-menu]` must be at the top. A plain browser page never shows it.
 - Positioned 8px right of the overflow launcher, re-measured every second, hidden when the window has no room left of the native window controls.
 - A confirmation popover (`Esc` or click-away closes it), then the control reads "正在重启…".
 - Bilingual (zh / en), following the app language.
 
+## The tools
+
+| Tool | Purpose |
+| --- | --- |
+| `harness_restart` | Request one restart. Arguments: `reason`, `resume` (`interrupted` default / `self` / `none`), `sessions[]`, `continuation`, `tasks[]`, `dryRun`. |
+| `harness_restart_status` | Read the current plan, the last finished restart, and unfinished entries. |
+| `harness_restart_cancel` | Drop a plan that has not reached the shell-stop stage yet (`armed`). |
+
+`harness_restart` asks the Agent approval service first (disable with `requireApproval: false`). Without an answerer it refuses with `approval-unavailable` instead of restarting unasked, and only a root Session may call it (a subagent gets `nested-agent`). After approval it writes the plan, starts the relaunch assistant, returns its result, and stops the shell about 1.5 s later — the delay exists so the tool result reaches the Session log before the process dies. Failures return `{ ok:false, code, message }` with `desktop-only`, `plan-busy`, `relaunch-unavailable`, `shell-alive`, `not-approved`, `approval-unavailable`, or `invalid-argument`.
+
+## How the continuation works
+
+1. Before the restart, the plan records every live root Session whose turn is open (`agents.roots()` plus `turnBoundaryOf(session).openTurnStartSeq`; subagent children and turns that ended or were deliberately stopped are not selected).
+2. About 1.5 s after the next Host boots, the plan is read and each Session receives
+   `sessionController.prompt({ sessionId, requestId: 'restart-<planId>-<session>', mode: 'queue', content: [continuation] })`,
+   which resumes the cold Session, rebuilds its Agent, appends the user message, and follows up.
+3. The instruction states the restart, asks for a short status recap, forbids redoing finished work, and forbids another restart unless the user asks for one.
+4. Delivery is idempotent: the `requestId` is stable per entry and `prompt` dedupes on it; the plan is written after every entry, so a second death only delivers what is missing.
+5. Bounds: `maxResumeSessions` (8), `staggerMs` (800), `planTtlMinutes` (60).
+
 ## How the restart works
 
-See [docs/mechanism.md](docs/mechanism.md) for the details. Short version:
+See [docs/mechanism.md](docs/mechanism.md). Short version:
 
 The Host is a child process of the Electron shell and `dsh-desktop-host` shuts itself down on `process.disconnect`, so the Host cannot survive the shell it just stopped. `relaunch.mjs` is started **before** the shell is stopped (detached, no pipes); it waits until the shell and the Host are gone, then starts the application the way a double click does (`explorer.exe <app exe>`), and verifies through the process table that it stayed alive. Failures are retried and then fall back to a direct launch.
 
-The executable path comes from the running Host's `process.execPath`; nothing is hard-coded to an install directory, and the `tasklist` image name is derived from it.
-
-Safety property: **the shell is never stopped without a ready relaunch assistant**. The worst case is a rejected request and an untouched app, never a stopped app with no way back.
+Safety property: **the shell is never stopped without a ready relaunch assistant**; a failed stop marks the plan `aborted`, so a later normal start cannot surprise anyone. The executable path comes from the running Host's `process.execPath`.
 
 ## Install
 
@@ -38,17 +64,46 @@ The patch inserts one row:
 
 Restart the application once after installing: both halves load at application start.
 
-## Logs
+## Configuration
 
-`%TEMP%\dsh-harness-restart\`: `restart.log` (restart timeline), `client-probe.log` (language sources as the page sees them), `launch-N.out.log` / `launch-N.err.log` (direct-launch attempts).
+Every key is optional:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `resume` | `interrupted` | Button-path resume policy; also preselects the switch when the popover opens |
+| `requireApproval` | `true` | Use the Agent approval service for the tool |
+| `maxResumeSessions` | `8` | Sessions continued after one restart |
+| `staggerMs` | `800` | Pause between two continuation prompts |
+| `restartDelayMs` | `1500` | Delay between the tool result and the shell stop |
+| `planTtlMinutes` | `60` | A plan older than this is never executed |
+| `continuationLanguage` | `auto` | `auto` follows the conversation; `zh` / `en` force |
+| `flushTimeoutMs` | `3000` | Budget for flushing live Sessions before the kill |
+| `bootDelayMs` | `1500` | Wait after boot before restoring |
+| `maxTasks` | `8` | Tasks per plan (also the most task lines the popover accepts) |
+| `storeDir` | `null` | Override the plan directory (default `$DSH_HOME/harness-restart`) |
+
+## Data and logs
+
+Plans and receipts: `$DSH_HOME\harness-restart\` — `plan.json` (atomic tmp+fsync+rename; corrupt files are renamed `plan.json.corrupt-*`), `history.jsonl`, `restart.lock`.
+
+Timeline logs: `%TEMP%\dsh-harness-restart\` — `restart.log`, `client-probe.log`, `launch-N.out.log` / `launch-N.err.log`.
 
 ## Limitations
 
 - Windows Desktop only; other environments answer `409 desktop-only`.
-- The restart stops the shell rather than running its graceful quit: running turns are interrupted (session logs survive).
+- The restart stops the shell rather than running its graceful quit: running turns are interrupted and then continued by the plan; the interrupted step itself is not resumed in place (Harness crash recovery only closes the turn).
+- Only a plan that reached `restarting` is delivered: an `armed` plan left behind by a Host that died before the assistant was ready is abandoned on the next start (`plan-abandoned`), never replayed.
+- Live Sessions are flushed before the kill; a flush timeout is logged and never waited on forever (the plan still covers the interruption).
 - The client bundle is an activation-time snapshot, so `client.js` changes need an application restart.
-- In some environments the automatic launch can fail (the process starts, no window appears). The logs show it; the fallback is a manual double click.
-- The client checks the Host version first, so mismatched halves never take the restart path.
+- In some environments the automatic launch can fail (the process starts, no window appears). The logs show it; the plan still runs on the next start while inside its TTL.
+- The continuation really does start model turns; bound them with `maxResumeSessions`, or pass `resume: 'none'`.
+
+## Development
+
+```powershell
+npm run check   # node --check for every entry and lib module
+npm test        # plan/policy/text/restore unit tests + headless client smoke
+```
 
 ## License
 
