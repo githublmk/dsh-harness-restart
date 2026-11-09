@@ -144,7 +144,7 @@ Update for version 0.2.1-rc.5 is not available (latest version: 0.2.2-rc.1, down
 ```json
 {
   "ok": true,
-  "version": "0.4.0",
+  "version": "0.4.1",
   "supported": true,
   "capabilities": ["restart", "resume", "tasks"],
   "lastPlan": { "planId": "rst-…", "at": 0, "finishedAt": 0, "ok": true, "resumed": 2, "tasks": 1 }
@@ -169,6 +169,8 @@ Update for version 0.2.1-rc.5 is not available (latest version: 0.2.2-rc.1, down
 | `relauncher: shell launch produced no application process` | explorer 启动后进程表里没新增 | 兜底直接 spawn 已自动尝试，看 `launch-N.err.log` |
 | `relauncher: launched through shell; application processes=N` | 成功 | 窗口应在几秒内出现 |
 | `host: restore: plan expired; not executed` | 计划超过 TTL | 正常保护；需要续作就重新发起一次重启 |
+| `relauncher: exited code=…` 出现在 `shell gone` 之后、没有 `launched` | 助手提前退出（例如事件循环被 unref 定时器清空） | 0.4.1 已修：`sleep` 不 unref，另有一个 keep-alive 定时器；`test/relaunch-process.test.mjs` 盯住这条性质 |
+| 只有 `shell gone` 而完全没有 `relauncher:` 行 | 助手根本没起来（`%TEMP%` 不可写等） | 看同目录 `launch-*.err.log`；手动启动应用即可，计划会在 TTL 内继续执行 |
 | `host: restore: sessionController unavailable; plan kept for the next start` | 恢复时服务没就绪 | 计划保留；下次启动再试 |
 | `host: restore: resume <id> -> skipped` | 会话不存在/归子代理 | 正常；回执里有 `session/not-found` 或 `session/agent-busy` |
 | `client-probe.log` 里 `resolved` 与界面语言不符 | 语言来源判定问题 | 看同一行的 `hints` |

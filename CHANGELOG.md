@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1
+
+- 修掉 `relaunch.mjs` 的静默退出：助手在等待壳/Host 消失时用了 `unref()` 定时器，事件循环被清空后进程直接退出，**壳已经停了但应用没被拉起**（真机 15:13 那次复现：日志停在 `host: shell gone`，应用是手动重开的）。现在 `sleep` 不再 unref，并额外用一个 keep-alive 定时器兜底；任何提前退出都会在日志里留下 `relauncher: exited code=…`。
+- 新增 `test/relaunch-process.test.mjs`：在「两个 pid 都还活着」的场景下断言助手进程不会在等待循环中退出。
+- 助手在 settle 等待之前写 `relaunch-launching` 回执，进程中途死掉也能在计划历史里看到尝试记录。
+- 版本握手升到 0.4.1（`lib/config.js` 与两端一致，`test/plugin.test.mjs` 断言之；客户端冒烟测试的假 Host 版本直接从 `client.js` 读取，不再手抄）。
+
 ## 0.4.0
 
 - 新增 `harness_restart` / `harness_restart_status` / `harness_restart_cancel` 三个工具：模型可以自己发起重启，用 `resume` 选恢复范围、用 `tasks` 排重启后任务、用 `dryRun` 只演练；调用前走 `ctx.approval` 审批卡。

@@ -80,7 +80,7 @@ test('GET answers the version handshake the Client half gates on', async () => {
   assert.equal(res.status, 200)
   const body = JSON.parse(res.body)
   assert.equal(body.ok, true)
-  assert.equal(body.version, '0.4.0')
+  assert.equal(body.version, VERSION)
   assert.deepEqual(body.capabilities, ['restart', 'resume', 'tasks'])
   assert.equal(body.resumeDefault, 'interrupted')
   assert.equal(body.maxTasks, 8)

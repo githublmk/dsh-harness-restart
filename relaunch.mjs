@@ -84,13 +84,22 @@ function alive(pid) {
   }
 }
 
-/** Wait between polls. */
+/** Wait between polls. The timer is deliberately NOT unref'd: this script has no
+ * other handles, so an unref'd timer lets Node empty the event loop and exit
+ * silently — leaving the shell stopped and nothing to start the app again. */
 function sleep(milliseconds) {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, milliseconds)
-    timer.unref?.()
+    setTimeout(resolve, milliseconds)
   })
 }
+
+/* Keep the loop alive for the whole run, and leave a line when this process
+ * ends for any reason, so a silent death is visible in the log afterwards. */
+const keepAlive = setInterval(() => {}, 60_000)
+process.on('exit', (code) => {
+  clearInterval(keepAlive)
+  log(`exited code=${String(code)}`)
+})
 
 log(`started pid=${String(process.pid)} shell=${shell === null ? 'unknown' : String(shell)} host=${host === null ? 'unknown' : String(host)}`)
 if (shell === null || host === null) {
@@ -126,6 +135,9 @@ if (shell !== null && alive(shell)) {
 const hostAlive = host !== null && alive(host)
 log(hostAlive ? 'shell is gone; the old host is still leaving' : 'shell and host are gone')
 if (!hostAlive) receipt('shell-stopped')
+/* Record the attempt before the settle delay: a helper that dies during it must
+ * still be visible in the plan's history. */
+receipt('relaunch-launching', { appExe })
 
 await sleep(SETTLE_MS)
 

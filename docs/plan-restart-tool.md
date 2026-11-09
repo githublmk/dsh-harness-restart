@@ -1,6 +1,6 @@
 # 实现方案：重启工具 + 重启后自动续作 + 自定义重启后任务
 
-> 状态：**已实现（0.4.0）**。本文件保留为设计记录；与实现不一致处以下面这条为准。
+> 状态：**已实现（0.4.x）**。本文件保留为设计记录；与实现不一致处以下面这条为准。
 > 结论都来自本机运行中的 Host（`cordis_inspect_query` 实时目录）与 `D:\codeSpace\js\dsh_code`（0.2.1-rc.2 源码）。
 >
 > 实现差异：选择策略落在 `lib/policy.js`；新增 `lib/config.js`（配置默认值与 `VERSION`）；版本、能力位与「最近一次重启」由同一个 `GET /dsh-harness-restart/restart` 返回，没有单开 `/status`；`harness_restart_status` 返回 `{ ok, active, plan, last, unfinished }`（字符串字段，避免嵌套 schema 校验风险）。

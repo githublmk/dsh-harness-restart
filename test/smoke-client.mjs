@@ -54,9 +54,13 @@ const fakeReact = {
   useCallback: hooks.useCallback,
 }
 
+/** The Client half's own handshake version, so the fake Host can never drift. */
+const clientVersion = /const VERSION = '([^']+)'/u.exec(source)?.[1]
+if (clientVersion === undefined) throw new Error('client.js does not declare VERSION')
+
 /** What the fake Host reports; each scenario adjusts it. */
 const host = {
-  version: '0.4.0',
+  version: clientVersion,
   supported: true,
   resumeDefault: 'interrupted',
   maxTasks: 8,
@@ -291,7 +295,7 @@ if (definition.id !== 'dsh-harness-restart') throw new Error(`unexpected module 
   if (buttons.length !== 1) throw new Error(`expected one button in the outdated popover, got ${buttons.length}`)
   if (posts().length !== 0) throw new Error('an outdated Host must never be asked to restart')
   console.log('outdated:', JSON.stringify(textOf(dialog)))
-  host.version = '0.4.0'
+  host.version = clientVersion
 }
 
 // --- unsupported Host
