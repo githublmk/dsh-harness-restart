@@ -23,7 +23,7 @@ window.__ModuleLoader__.load({
     const { useCallback, useEffect, useState } = React
 
     /** Version the Host half must report before the action is offered. */
-    const VERSION = '0.4.5'
+    const VERSION = '0.4.6'
     /** Same-origin route the Host half answers (forwarded by the Desktop shell). */
     const ROUTE = '/dsh-harness-restart/restart'
     /** Height of the control, matching one caption panel row. */
@@ -196,7 +196,10 @@ window.__ModuleLoader__.load({
 
     /** The element whose right edge the control follows. */
     function captionAnchor() {
-      const nav = document.querySelector('nav:has(> [class*="panelRow"])')
+      /* 0.2.2 wraps every caption entry in a `panelEntry` block, so the shipped
+       * row is no longer a direct child of the nav; the nav's own `panelList`
+       * class is the stable shape, and the old one stays for a 0.2.1 build. */
+      const nav = document.querySelector('nav[class*="panelList"], nav:has(> [class*="panelRow"])')
       if (nav !== null) {
         const band = nav.getBoundingClientRect()
         /* Only the Desktop caption band qualifies; the same nav sits vertically

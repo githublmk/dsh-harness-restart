@@ -1,6 +1,6 @@
 {
   "name": "dsh-harness-restart",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "private": true,
   "type": "module",
   "description": "Restart control and restart tool for the DeepSeek Harness Desktop: a caption-band button plus harness_restart*, a durable restart plan, and automatic continuation of the Sessions and tasks a restart interrupted.",
