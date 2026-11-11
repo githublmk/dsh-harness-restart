@@ -157,7 +157,9 @@ function mount() {
   api.apply({
     slots: {
       inject: (owner, callback) => {
-        if (owner !== 'shell.overlay') throw new Error(`unexpected owner slot ${owner}`)
+        if (owner !== 'shell.overlay' && owner !== 'sidebar.panellist.actions') {
+          throw new Error(`unexpected owner slot ${owner}`)
+        }
         callback()
       },
       register: (options, component) => {
@@ -168,13 +170,17 @@ function mount() {
     locale,
     effect: (fn) => fn(),
   })
-  if (registrations.length !== 1) throw new Error(`expected one registration, got ${registrations.length}`)
-  const { options, component } = registrations[0]
-  if (options.name !== 'shell.overlay' || options.id !== 'harness-restart') {
-    throw new Error(`unexpected registration ${JSON.stringify(options)}`)
+  if (registrations.length !== 2) throw new Error(`expected two registrations, got ${registrations.length}`)
+  const overlay = registrations.find((entry) => entry.options.name === 'shell.overlay')
+  const menu = registrations.find((entry) => entry.options.name === 'sidebar.panellist.actions')
+  if (overlay === undefined || menu === undefined) {
+    throw new Error(`unexpected registrations ${JSON.stringify(registrations.map((entry) => entry.options))}`)
   }
-  render(component)
-  return { component, tree: render(component) }
+  if (overlay.options.id !== 'harness-restart' || menu.options.id !== 'harness-restart') {
+    throw new Error(`unexpected registration ids ${JSON.stringify(registrations.map((entry) => entry.options))}`)
+  }
+  render(overlay.component)
+  return { component: overlay.component, menu, tree: render(overlay.component) }
 }
 
 /** Click the control, wait for the probe, and return the open dialog. */
@@ -341,6 +347,72 @@ if (definition.id !== 'dsh-harness-restart') throw new Error(`unexpected module 
     throw new Error(`unexpected notice copy ${JSON.stringify(noticeText)}`)
   }
   console.log('notice:', JSON.stringify(noticeText))
+}
+
+// --- a Web layout (sidebar column, not a caption band) seats nothing
+{
+  const savedDocument = globalThis.document
+  const savedWidth = globalThis.window.innerWidth
+  const column = {
+    getBoundingClientRect: () => ({ left: 0, right: 280, top: 0, bottom: 900, width: 280, height: 900 }),
+    querySelector: () => null,
+  }
+  const drawer = {
+    getBoundingClientRect: () => ({ left: -300, right: 0, top: 0, bottom: 900, width: 300, height: 900 }),
+    querySelector: () => null,
+  }
+  globalThis.document = { querySelector: (selector) => (selector.startsWith('nav') ? column : null) }
+  for (const width of [390, 1440]) {
+    globalThis.window.innerWidth = width
+    const { tree } = mount()
+    if (find(tree, (node) => node.type === 'button') !== null) {
+      throw new Error(`the control was seated in the Web sidebar at ${width}px`)
+    }
+  }
+  globalThis.document = { querySelector: (selector) => (selector.startsWith('nav') ? drawer : null) }
+  globalThis.window.innerWidth = 1440
+  const { tree } = mount()
+  if (find(tree, (node) => node.type === 'button') !== null) {
+    throw new Error('the control was seated on an off-canvas drawer')
+  }
+  console.log('web layout: control hidden')
+  globalThis.document = savedDocument
+  globalThis.window.innerWidth = savedWidth
+}
+
+// --- the More-menu row is the Web layout's only restart entry
+{
+  const savedDocument = globalThis.document
+  const savedWidth = globalThis.window.innerWidth
+  const column = {
+    getBoundingClientRect: () => ({ left: 0, right: 280, top: 0, bottom: 900, width: 280, height: 900 }),
+    querySelector: () => null,
+  }
+  globalThis.document = { querySelector: (selector) => (selector.startsWith('nav') ? column : null) }
+  globalThis.window.innerWidth = 390
+  requests.length = 0
+  const { component, menu } = mount()
+  let dismissed = 0
+  const rowTree = menu.component({
+    entries: [{ id: 'plugins', label: 'Plugins', pinned: false }],
+    onOpen() {},
+    onPinnedChange() {},
+    onDismiss: () => { dismissed += 1 },
+  })
+  const row = find(rowTree, (node) => node.type === 'button')
+  if (row === null) throw new Error('the More menu rendered no row')
+  if (textOf(row) !== '重启应用与 Host') throw new Error(`unexpected row copy ${JSON.stringify(textOf(row))}`)
+  row.props.onClick()
+  if (dismissed !== 1) throw new Error('the row did not close the More menu')
+  render(component)
+  hooks.settle()
+  await tick()
+  const dialog = find(render(component), (node) => node.props?.role === 'dialog')
+  if (dialog === null) throw new Error('the More-menu row did not open the confirmation')
+  if (!textOf(dialog).includes('重启应用与 Host？')) throw new Error(`unexpected dialog ${JSON.stringify(textOf(dialog))}`)
+  console.log('more menu: confirmation opened from the row')
+  globalThis.document = savedDocument
+  globalThis.window.innerWidth = savedWidth
 }
 
 console.log('SMOKE OK')

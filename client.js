@@ -21,6 +21,17 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
     const { useCallback, useEffect, useState } = React
+    /**
+     * Menu row widget of the platform primitives. Every bundle resolves the
+     * same frozen platform table, so the sidebar's own menu uses it; a carrier
+     * without it falls back to a plain button row.
+     */
+    let MenuItemButton
+    try {
+      ;({ MenuItemButton } = require('@deepseek-ai/dsh-client-ui-primitives'))
+    } catch {
+      MenuItemButton = undefined
+    }
 
     /** Version the Host half must report before the action is offered. */
     const VERSION = '0.4.6'
@@ -28,6 +39,12 @@ window.__ModuleLoader__.load({
     const ROUTE = '/dsh-harness-restart/restart'
     /** Height of the control, matching one caption panel row. */
     const CONTROL_HEIGHT = 28
+    /** A caption band is a short strip; anything taller is a layout column. */
+    const CAPTION_MAX_HEIGHT = 96
+    /** Below this width only the Web (phone) layout exists, and it has no band. */
+    const CAPTION_MIN_VIEWPORT = 520
+    /** Widest the confirmation popover gets before it must fit the viewport. */
+    const MAX_POPOVER_WIDTH = 360
     /** Right-hand band reserved for the native window controls. */
     const WINDOW_CONTROLS_RESERVE = 168
     /** Locale namespace the strings are registered under. */
@@ -45,6 +62,7 @@ window.__ModuleLoader__.load({
     const TEXT = {
       'zh-CN': {
         label: '重启',
+        menuLabel: '重启应用与 Host',
         tooltip: '重启应用与 Host（重启后可继续被中断的会话）',
         title: '重启应用与 Host？',
         body: '正在进行的任务会被中断；重启完成后，被中断的会话会自动继续。',
@@ -65,6 +83,7 @@ window.__ModuleLoader__.load({
       },
       en: {
         label: 'Restart',
+        menuLabel: 'Restart app and Host',
         tooltip: 'Restart the app and Host (interrupted Sessions continue afterwards)',
         title: 'Restart the app and Host?',
         body: 'Running tasks are interrupted; interrupted Sessions continue automatically after the restart.',
@@ -194,35 +213,128 @@ window.__ModuleLoader__.load({
       return (key) => table[key] ?? key
     }
 
-    /** The element whose right edge the control follows. */
-    function captionAnchor() {
+    /**
+     * Whether one rectangle is the Desktop caption strip rather than a layout
+     * column. A plain Web page renders the same nav vertically down the left
+     * edge, and on a phone that column starts at the top of the viewport with
+     * the conversation scrolling beside it, so position alone would seat the
+     * fixed control in the middle of the chat. A caption band is short, wide
+     * and fully on screen.
+     * @param band - bounds of the candidate element.
+     * @returns true only for a caption-like strip.
+     */
+    function isCaptionBand(band) {
+      return band.width > 0 && band.height > 0
+        && band.height <= CAPTION_MAX_HEIGHT
+        && band.width >= band.height * 2
+        && band.top < 60
+        && band.right > 0
+    }
+
+    /**
+     * The caption-band element whose right edge the control follows, or null
+     * when this layout has no caption band (a phone or a plain Web page keeps
+     * the same nav as a vertical sidebar column).
+     * @returns the band's bounds, or null.
+     */
+    function captionBand() {
+      if (window.innerWidth < CAPTION_MIN_VIEWPORT) return null
       /* 0.2.2 wraps every caption entry in a `panelEntry` block, so the shipped
        * row is no longer a direct child of the nav; the nav's own `panelList`
        * class is the stable shape, and the old one stays for a 0.2.1 build. */
       const nav = document.querySelector('nav[class*="panelList"], nav:has(> [class*="panelRow"])')
       if (nav !== null) {
         const band = nav.getBoundingClientRect()
-        /* Only the Desktop caption band qualifies; the same nav sits vertically
-         * in the sidebar of a plain Web page. */
-        if (band.width > 0 && band.height > 0 && band.top < 60) {
+        if (isCaptionBand(band)) {
           const launcher = nav.querySelector('[aria-haspopup]')
           const rect = launcher === null ? null : launcher.getBoundingClientRect()
-          const reference = rect !== null && rect.width > 0 && rect.height > 0 ? rect : band
-          return {
-            left: Math.round(reference.right) + 8,
-            top: Math.round(reference.top + (reference.height - CONTROL_HEIGHT) / 2),
-          }
+          return rect !== null && rect.width > 0 && rect.height > 0 ? rect : band
         }
       }
       const menubar = document.querySelector('[data-windows-menu]')
-      const rect = menubar === null ? null : menubar.getBoundingClientRect()
-      if (rect !== null && rect.width > 0 && rect.top < 60) {
-        return {
-          left: Math.round(rect.right) + 8,
-          top: Math.round(rect.top + (rect.height - CONTROL_HEIGHT) / 2),
-        }
+      if (menubar !== null) {
+        const rect = menubar.getBoundingClientRect()
+        if (isCaptionBand(rect)) return rect
       }
       return null
+    }
+
+    /** The seat the fixed control takes when a caption band exists. */
+    function captionAnchor() {
+      const reference = captionBand()
+      if (reference === null) return null
+      return {
+        left: Math.round(reference.right) + 8,
+        top: Math.round(reference.top + (reference.height - CONTROL_HEIGHT) / 2),
+      }
+    }
+
+    /** Whether this layout already carries the caption-band control. */
+    function hasCaptionBand() {
+      return captionBand() !== null
+    }
+
+    /** Center seat for a confirmation opened from the More menu. */
+    function centerSeat() {
+      const width = Math.min(MAX_POPOVER_WIDTH, window.innerWidth - 24)
+      return {
+        left: Math.max(8, Math.round((window.innerWidth - width) / 2)),
+        top: Math.min(200, Math.max(72, Math.round(window.innerHeight * 0.15))),
+      }
+    }
+
+    /**
+     * Overlay controls listening for a More-menu request. The overlay owns the
+     * confirmation dialog, so the menu row only asks it to open.
+     */
+    const openRequests = new Set()
+
+    /** Ask the mounted control to open its confirmation. */
+    function requestOpenFromMenu() {
+      for (const listener of openRequests) listener()
+    }
+
+    /**
+     * One row of the panel list's More menu.
+     * @param icon - leading glyph.
+     * @param label - row text.
+     * @param onSelect - activation handler.
+     * @param separatorBefore - whether the owner's own rows precede this one.
+     */
+    function menuRow(icon, label, onSelect, separatorBefore) {
+      if (MenuItemButton !== undefined) {
+        return h(MenuItemButton, { icon, separatorBefore, onSelect }, label)
+      }
+      return h('button', {
+        type: 'button',
+        role: 'menuitem',
+        onClick: onSelect,
+        style: {
+          display: 'flex', alignItems: 'center', gap: 8, width: '100%',
+          padding: '8px 10px', border: 'none', background: 'transparent',
+          color: 'var(--dsw-alias-label-primary)', font: 'inherit', fontSize: 14,
+          textAlign: 'left', cursor: 'pointer',
+          ...(separatorBefore ? { borderTop: '1px solid var(--dsw-alias-border-l1)' } : {}),
+        },
+      }, icon, h('span', null, label))
+    }
+
+    /**
+     * Build the More-menu row. Layouts without a caption band have no other
+     * seat, and the row opens the same confirmation the caption control does.
+     * @param ctx - the Client root context carrying the locale service.
+     */
+    function createMenuEntry(ctx) {
+      return function RestartMenuEntry(props) {
+        const { entries = [], onDismiss } = props ?? {}
+        /* The Desktop caption band already carries the control. */
+        if (hasCaptionBand()) return null
+        const table = TEXT[language(ctx)] ?? TEXT['zh-CN']
+        return menuRow(glyph(), table.menuLabel, () => {
+          if (typeof onDismiss === 'function') onDismiss()
+          requestOpenFromMenu()
+        }, entries.length > 0)
+      }
     }
 
     /**
@@ -313,6 +425,10 @@ window.__ModuleLoader__.load({
         const [tasksText, setTasksText] = useState('')
         const [notice, setNotice] = useState(null)
         const [maxTasks, setMaxTasks] = useState(MAX_TASKS)
+        /** Seat of a dialog opened from the More menu: no caption band to hang it from. */
+        const [menuSeat, setMenuSeat] = useState(null)
+        /** A More-menu request waiting for the probe; the effect below owns it. */
+        const [menuRequested, setMenuRequested] = useState(false)
 
         useEffect(() => () => {
           cancelLater(watchdog)
@@ -321,7 +437,10 @@ window.__ModuleLoader__.load({
         useEffect(() => {
           if (!open) return undefined
           const onKey = (event) => {
-            if (event.key === 'Escape') setOpen(false)
+            if (event.key === 'Escape') {
+              setOpen(false)
+              setMenuSeat(null)
+            }
           }
           window.addEventListener('keydown', onKey)
           return () => window.removeEventListener('keydown', onKey)
@@ -478,16 +597,41 @@ window.__ModuleLoader__.load({
           setOpen(true)
         }, [busy, open, probe])
 
-        if (anchor === null) return null
+        /* The More menu has no caption control to press: its row asks this
+         * component to open the same confirmation in the middle of the view. */
+        useEffect(() => {
+          const listener = () => {
+            setMenuSeat(centerSeat())
+            setMenuRequested(true)
+          }
+          openRequests.add(listener)
+          return () => {
+            openRequests.delete(listener)
+          }
+        }, [])
 
-        const popoverWidth = 360
-        const popoverLeft = Math.max(8, Math.min(anchor.left, window.innerWidth - popoverWidth - 12))
+        useEffect(() => {
+          if (!menuRequested) return
+          setMenuRequested(false)
+          void toggle()
+        }, [menuRequested])
+
+        const seat = anchor ?? menuSeat
+        if (seat === null) return null
+
+        const popoverWidth = Math.min(MAX_POPOVER_WIDTH, window.innerWidth - 24)
+        const popoverLeft = Math.max(8, Math.min(seat.left, window.innerWidth - popoverWidth - 12))
         const blocked = error === 'outdated' || error === 'unsupported'
+        /** Dismiss the dialog and forget a More-menu seat so it cannot linger. */
+        const closeDialog = () => {
+          setOpen(false)
+          setMenuSeat(null)
+        }
 
         const backdrop = open
           ? h('div', {
             key: 'backdrop',
-            onClick: () => setOpen(false),
+            onClick: () => closeDialog(),
             style: {
               position: 'fixed', inset: 0, zIndex: 1190,
               background: 'transparent', pointerEvents: 'auto',
@@ -507,8 +651,8 @@ window.__ModuleLoader__.load({
           onMouseLeave: () => setHover(false),
           style: {
             position: 'fixed',
-            left: anchor.left,
-            top: anchor.top,
+            left: seat.left,
+            top: seat.top,
             height: CONTROL_HEIGHT,
             boxSizing: 'border-box',
             display: 'inline-flex',
@@ -539,8 +683,10 @@ window.__ModuleLoader__.load({
             style: {
               position: 'fixed',
               left: popoverLeft,
-              top: anchor.top + CONTROL_HEIGHT + 6,
+              top: seat.top + CONTROL_HEIGHT + 6,
               width: popoverWidth,
+              maxHeight: Math.max(200, window.innerHeight - seat.top - CONTROL_HEIGHT - 24),
+              overflowY: 'auto',
               boxSizing: 'border-box',
               padding: 14,
               borderRadius: 10,
@@ -618,9 +764,9 @@ window.__ModuleLoader__.load({
             style: { display: 'flex', justifyContent: 'flex-end', gap: 8 },
           },
           blocked
-            ? actionButton('close', text('cancel'), false, () => setOpen(false))
+            ? actionButton('close', text('cancel'), false, () => closeDialog())
             : [
-              actionButton('cancel', text('cancel'), false, () => setOpen(false)),
+              actionButton('cancel', text('cancel'), false, () => closeDialog()),
               actionButton('confirm', text('confirm'), true, () => { confirm() }),
             ],
           ),
@@ -635,8 +781,8 @@ window.__ModuleLoader__.load({
             onClick: () => setNotice(null),
             style: {
               position: 'fixed',
-              left: anchor.left,
-              top: anchor.top + CONTROL_HEIGHT + 6,
+              left: seat.left,
+              top: seat.top + CONTROL_HEIGHT + 6,
               maxWidth: 380,
               padding: '4px 10px',
               borderRadius: 6,
@@ -655,7 +801,7 @@ window.__ModuleLoader__.load({
             tasks: notice.tasks,
           }))
 
-        return h(React.Fragment, null, backdrop, control, popover, noticeNode)
+        return h(React.Fragment, null, backdrop, anchor === null ? null : control, popover, noticeNode)
       }
     }
 
@@ -670,6 +816,14 @@ window.__ModuleLoader__.load({
           order: 1000,
           label: 'Restart',
         }, Control))
+        /* The sidebar shows its "More" menu while this list has rows; on a
+         * Web layout the row is the only way to reach the restart. */
+        ctx.slots.inject('sidebar.panellist.actions', () => ctx.slots.register({
+          name: 'sidebar.panellist.actions',
+          id: 'harness-restart',
+          order: 1000,
+          label: 'Restart',
+        }, createMenuEntry(ctx)))
       },
     }
   },
