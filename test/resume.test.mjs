@@ -192,7 +192,9 @@ test('a subagent whose parent cannot be revived is skipped', async () => {
     agents: {
       get: () => undefined,
       async resume() {
-        throw new Error('the session is not resumable')
+        const error = new Error('session not found')
+        error.code = 'session/not-found'
+        throw error
       },
     },
     subagents: { async prompt() { throw new Error('the parent is missing') } },
@@ -204,7 +206,7 @@ test('a subagent whose parent cannot be revived is skipped', async () => {
   assert.equal(finished.resume[0].error, 'subagent/parent-unavailable')
 })
 
-test('an uncontinuable subagent is skipped while a transient failure stays retryable', async () => {
+test('an uncontinuable subagent is skipped while a transient failure is retried', async () => {
   const failing = (code) => async () => {
     const error = new Error(code)
     error.code = code
@@ -239,6 +241,92 @@ test('an uncontinuable subagent is skipped while a transient failure stays retry
   })
   assert.equal(retried.resume[0].state, 'failed')
   assert.equal(retried.resume[0].error, 'subagent/delivery-unavailable')
+  /* The plan stays executable so the next start tries the entry again. */
+  assert.equal(retried.state, STATE.executing)
+
+  const again = await executePlan({
+    plan: second,
+    directory,
+    sessionController: fakeController(),
+    agents: { get: () => ({ id: 'session-root' }) },
+    subagents: { async prompt() { return { messageId: 'm-1' } } },
+    config: { staggerMs: 0 },
+    language: 'zh',
+    sleep: async () => {},
+  })
+  assert.equal(again.resume[0].state, 'delivered')
+  assert.equal(again.resume[0].lastError, 'subagent/delivery-unavailable')
+  assert.equal(again.state, STATE.done)
+})
+
+test('a subagent whose parent is archived is skipped without reviving it', async () => {
+  const plan = makeSubagentPlan()
+  writePlan(directory, plan)
+  const revived = []
+  const finished = await executePlan({
+    plan,
+    directory,
+    sessionController: fakeController(),
+    agents: {
+      get: () => undefined,
+      async resume(request) {
+        revived.push(request)
+        return { agent: { id: request.resumeSessionId } }
+      },
+    },
+    subagents: { async prompt() { throw new Error('an archived parent must not authorize a child') } },
+    archived: new Set(['session-root']),
+    config: { staggerMs: 0 },
+    language: 'zh',
+    sleep: async () => {},
+  })
+  assert.deepEqual(revived, [])
+  assert.equal(finished.resume[0].state, 'skipped')
+  assert.equal(finished.resume[0].error, 'subagent/parent-unavailable')
+})
+
+test('a grandchild is delivered only after the child that has to revive it', async () => {
+  const plan = createPlan({
+    origin: 'tool',
+    language: 'zh',
+    requestedBy: { sessionId: 'session-root' },
+    resume: [
+      /* Listed first, and without delegationDepth, on purpose. */
+      { sessionId: 'session-grandchild', kind: 'subagent', parentSession: 'session-child' },
+      { sessionId: 'session-child', kind: 'subagent', parentSession: 'session-root' },
+      { sessionId: 'session-root' },
+    ],
+    now: Date.now(),
+  })
+  writePlan(directory, plan)
+  const live = new Set()
+  const delivered = []
+  const agents = {
+    get: (id) => (live.has(id) ? { id } : undefined),
+    async resume(request) {
+      live.add(request.resumeSessionId)
+      return { agent: { id: request.resumeSessionId } }
+    },
+  }
+  const subagents = {
+    async prompt(request) {
+      delivered.push(request.childSessionId)
+      live.add(request.childSessionId)
+      return { messageId: 'm-1' }
+    },
+  }
+  const finished = await executePlan({
+    plan,
+    directory,
+    sessionController: fakeController(),
+    agents,
+    subagents,
+    config: { staggerMs: 0 },
+    language: 'zh',
+    sleep: async () => {},
+  })
+  assert.deepEqual(delivered, ['session-child', 'session-grandchild'])
+  assert.equal(finished.state, STATE.done)
 })
 
 test('a Host without the subagent service skips the children and keeps the roots', async () => {
@@ -256,6 +344,76 @@ test('a Host without the subagent service skips the children and keeps the roots
   assert.equal(finished.resume[0].state, 'skipped')
   assert.equal(finished.resume[0].error, 'subagents-unavailable')
   assert.equal(finished.resume[1].state, 'delivered')
+})
+
+test('a subagent whose parent is an uncontinued subagent is skipped, not revived', async () => {
+  const plan = createPlan({
+    origin: 'tool',
+    language: 'zh',
+    resume: [
+      { sessionId: 'session-child', kind: 'subagent', parentSession: 'session-root', delegationDepth: 1 },
+      { sessionId: 'session-grandchild', kind: 'subagent', parentSession: 'session-child', delegationDepth: 2 },
+    ],
+    now: Date.now(),
+  })
+  writePlan(directory, plan)
+  const revived = []
+  const live = new Set()
+  const finished = await executePlan({
+    plan,
+    directory,
+    sessionController: fakeController(),
+    agents: {
+      get: (id) => (live.has(id) ? { id } : undefined),
+      async resume(request) {
+        revived.push(request.resumeSessionId)
+        live.add(request.resumeSessionId)
+        return { agent: { id: request.resumeSessionId } }
+      },
+    },
+    subagents: {
+      async prompt(request) {
+        if (request.childSessionId === 'session-child') {
+          const error = new Error('no continuation state')
+          error.code = 'subagent/not-resumable'
+          throw error
+        }
+        live.add(request.childSessionId)
+        return { messageId: 'm-1' }
+      },
+    },
+    config: { staggerMs: 0 },
+    language: 'zh',
+    sleep: async () => {},
+  })
+  assert.equal(finished.resume[0].state, 'skipped')
+  assert.equal(finished.resume[1].state, 'skipped')
+  assert.equal(finished.resume[1].error, 'subagent/parent-unavailable')
+  /* Only the root may be revived; a subagent is never republished as one. */
+  assert.deepEqual(revived, ['session-root'])
+})
+
+test('the boot restore waits for a late subagent service instead of skipping', async () => {
+  const bootDirectory = await mkdtemp(join(tmpdir(), 'harness-restart-late-subagents-'))
+  try {
+    const plan = makeSubagentPlan()
+    plan.state = STATE.restarting
+    writePlan(bootDirectory, plan)
+    const controller = fakeController()
+    const ctx = {
+      get: (key) => (key === 'sessionController' ? controller : undefined),
+      effect: (fn) => fn(),
+    }
+    scheduleBootRestore(ctx, { bootDelayMs: 0, staggerMs: 0, planTtlMinutes: 60 }, {
+      directory: bootDirectory,
+      log: () => {},
+    })
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    assert.equal(controller.prompts.length, 0)
+    assert.equal(readPlan(bootDirectory).state, STATE.restarting)
+  } finally {
+    await rm(bootDirectory, { recursive: true, force: true })
+  }
 })
 
 test('executePlan delivers continuations and tasks, then finishes', async () => {

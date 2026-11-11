@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.5
+
+评审后对 0.4.4 的加固（正常路径已真机验证：一次重启包含 2 个运行中的子智能体，两条都 `delivered`，子会话从检查点续跑并 `send_message` 回传结论）：
+
+- **`failed` 真的会重试**：之前只把暂时性失败记成 `failed` 就结束，文档却写着「下次启动再试」。现在每轮恢复开始把 `failed` 改回 `pending`（旧错误留 `lastError`），只要还有 `failed` 计划就保持 `executing`，下一次启动再试一轮，直到计划过期；`skipped` 永不重试。
+- **只唤醒根会话**：父会话本身是未被续作的子会话时不再 `agents.resume` 它——那会把子会话发布成新的运行时根、且它自己的结论没有读者；这种情况直接记 `subagent/parent-unavailable`。`agents.resume` 返回的 `AgentHandle.agent` 直接当作父 agent 使用。
+- **归档的父会话不再被唤醒**：开机时读 `workspaceRegistry.archivedSessionIds`，父会话已归档则跳过该子条目。
+- **抢救失败的错误分类**：只有 `session/not-found` 视为永久失败（`subagent/parent-unavailable`），其余抢救错误保留原错误码并按暂时性失败重试。
+- **投递顺序改按父链**：用 `parentSession` 链的祖先数排序（`delegationDepth` 是可选 header 字段），孙会话不会在子会话之前投递。
+- **开机就绪门**：计划里有子智能体条目而 `subagents` 服务还没挂上时，像 `sessionController` 一样等待重试；旧 Host 始终不提供则回退为跳过子条目，不阻塞根会话。
+- 文案/文档：子会话「正在被恢复」；README(.en) 收紧幂等与限制口径；`docs/plan-restart-tool.md` 修掉「决策 1」与显式 `sessions` 的边界说明；`docs/mechanism.md` 补重试语义与 `session/agent-busy` 的新注解。
+- 单测：`failed` → 重试 → 成功、归档父会话、未续作子父会话不唤醒、无 `delegationDepth` 的孙会话顺序、开机等 `subagents`（79 个用例全绿）。
+- 版本握手升到 0.4.5（需重开一次应用生效）。
+
 ## 0.4.4
 
 - **恢复范围包含子智能体**：重启瞬间正在回合中的子会话也会入计划（`kind: 'subagent'` + `parentSession` + `delegationDepth`），开机后按「根 → 浅 → 深」投递；子会话从不直接 `prompt`，而是由**活着的直接父会话**经 `subagents.prompt({ mode:'continuable', delivery:'queue' })` 冷启动，这正是 Host 允许的唯一路径。

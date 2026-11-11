@@ -37,7 +37,7 @@ A **Restart** control and a **restart tool** for the DeepSeek Harness Desktop: r
    - a subagent receives `subagents.prompt({ requestId, parentSessionId, childSessionId, mode: 'continuable', delivery: 'queue', content: [continuation] })`. A child is never prompted directly: the Host only continues it from its **live direct parent**, so that parent has to be resumed first. When the parent had no open turn (a lead that stopped while a teammate ran), it is revived on its own with `agents.resume` so it can receive the child's result. A child whose parent cannot be revived, or one that is not continuable (one-shot), is recorded as `skipped` and never retried.
 3. The instruction states the restart, asks for a short status recap, forbids redoing finished work, tells a subagent to return its result to the parent with `send_message`, and forbids another restart unless the user asks for one. A root is also told which of its restarted children are running on their own, so it does not re-delegate the same work.
 4. Only the Session that requested the restart can customise its own next move: `continuation` is attached to that Session's entry alone, and every other resumed Session (subagents included) gets the standard instruction. Supplying `continuation` while that Session is not being resumed (`resume: 'none'`, or `sessions` without it) fails with `continuation-without-self` instead of restarting with a hint nobody would read.
-5. Delivery is idempotent: the `requestId` is stable per entry and `prompt` dedupes on it; the plan is written after every entry, so a second death only delivers what is missing.
+5. Delivery is idempotent for roots: the `requestId` is stable per entry and `prompt` dedupes on it; the plan is written after every entry, so a second death only delivers what is missing. A child goes through `subagents.prompt`, which has no `requestId` dedupe, so a death in the instant between "child accepted" and "plan written" can deliver that one child twice (see Limitations).
 6. Bounds: `maxResumeSessions` (8, counting roots and subagents together), `staggerMs` (800), `planTtlMinutes` (60). The tool's `note` promises a continuation only to a Session the plan actually resumes, and counts the subagents it includes.
 
 ## How the restart works
@@ -110,7 +110,8 @@ Timeline logs: `%TEMP%\dsh-harness-restart\` — `restart.log`, `client-probe.lo
 - The client bundle is an activation-time snapshot, so `client.js` changes need an application restart.
 - In some environments the automatic launch can fail (the process starts, no window appears). The logs show it; the plan still runs on the next start while inside its TTL.
 - The continuation really does start model turns; bound them with `maxResumeSessions` (roots and subagents together), or pass `resume: 'none'`.
-- Only **continuable** subagents can be continued (the ones whose Session carries continuation state and that `send_message` can reach). A one-shot subagent, or a child whose parent Session was not resumed, is recorded as `skipped` (`subagent/not-resumable` / `subagent/parent-unavailable`) and never retried.
+- Only **continuable** subagents can be continued (the ones whose Session carries continuation state and that `send_message` can reach). A one-shot subagent, a child whose parent is archived, or one whose parent cannot be revived, is recorded as `skipped` (`subagent/not-resumable` / `subagent/parent-unavailable`) and never retried.
+- An entry recorded as `failed` (for example `subagent/delivery-unavailable`, or any other transient error) keeps the plan `executing`, so the **next start retries it** until the plan expires (`planTtlMinutes`, 60 minutes by default). `skipped` entries are never retried.
 
 ## Development
 

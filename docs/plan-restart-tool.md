@@ -293,7 +293,8 @@ await ctx.subagents.prompt({
 - `continuationHint` 是**逐条目**的：只有发起重启的会话自己那条带工具给的 `continuation`，其余条目为 `undefined`，续作文案因此按条目生成，而不是按计划生成。
 - 用 `ctx.sessionController.prompt` 而不是自己拼消息：它负责 resume、`user-rpc` 来源、按 `requestId` 去重、附件/文件回执校验，且 agent 的生命周期归 Session Controller（不会随本插件卸载而析构）。
 - `mode: 'queue'` → `agent.followup(...)`：空闲则立刻起回合，忙则排在下一回合；不会打断用户正在输入的内容。
-- 失败分类：`session/not-found`、`session/agent-busy`、`session/writer-held`、`gateway/internal` → 记录回执并继续下一条；本条目 `failed`，不阻塞其它条目。子智能体侧不重试的是 `subagent/not-resumable`（one-shot 或没有 continuation 状态）、`subagent/unauthorized`、`subagent/parent-unavailable`、`subagent/not-found`、`subagents-unavailable`（旧 Host），记 `skipped`；`subagent/delivery-unavailable` 只是暂时不可用，记 `failed`，开机重跑时再试。
+- 失败分类：`session/not-found`、`session/agent-busy`、`session/writer-held`、`gateway/internal` 等 → 记录回执并继续下一条。子智能体侧永久失败的是 `subagent/not-resumable`（one-shot 或没有 continuation 状态）、`subagent/unauthorized`、`subagent/parent-unavailable`、`subagent/not-found`、`subagents-unavailable`（旧 Host），记 `skipped`，永不重试；其余（含 `subagent/delivery-unavailable`）记 `failed`，**每轮开始会把它改回 `pending`，计划保持 `executing`，下一次启动再试**，直到计划过期。
+- 显式 `sessions: [子会话 id]` 里点名一个当时没在跑、又不在活体清单里的子会话时，Host 只能把它当普通会话 `prompt`（多半得到 `session/agent-busy` 并记 `skipped`）；要稳定续作子智能体，用它正在运行时的那次 `interrupted` 快照，别手写 id。
 - 已知的窄窗口：`subagents.prompt` 没有 `requestId` 去重（根会话那条有），如果 Host 恰好在“子会话已接受、计划还没写盘”之间再次挂掉，下一次启动可能把同一条续作再投一次。窗口只有一次写盘的时间，文案本身是幂等的（子会话会看到重复的重启说明）。
 
 ### 6.3 续作指令文案
@@ -483,7 +484,7 @@ CHANGELOG.md             改：0.4.0
 
 ## 15. 已确认的决定
 
-1. **默认恢复范围**：`interrupted` —— 重启瞬间处于回合中的所有根会话。
+1. **默认恢复范围**：`interrupted` —— 重启瞬间处于回合中的所有根会话，以及它们正在运行的子智能体（见第 6 条）。
 2. **工具审批卡**：保留（`requireApproval: true`；`rejected` / `cancelled` → `not-approved`，没有应答者 `unavailable` → `approval-unavailable`，都失败关闭，不写计划）。
 3. **按钮也加自定义任务**：气泡里同时提供恢复开关与任务输入框（P1 一并交付）。
 4. **续作文案语言**：跟随对话语言（`continuationLanguage: auto`，可强制 `zh`/`en`）。

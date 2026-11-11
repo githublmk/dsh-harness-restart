@@ -66,7 +66,7 @@
    - 子智能体：`subagents.prompt({ requestId, parentSessionId, childSessionId, mode:'continuable', delivery:'queue', content:[续作指令] })`。子智能体从不被直接 prompt——Host 只允许从**活着的直接父会话**冷启动子会话，所以父会话必须先恢复；父会话当时没有开放回合（例如队长已结束回合、队员还在跑）时会先用 `agents.resume` 把它单独唤醒，让它接得住子会话的结论。父会话救不回来、或子会话不是 continuable（one-shot）时该条目记 `skipped`，不会重试。
 3. 续作指令明确写着：先复述进度 → 从检查点继续 → 已完成的不重做 → 子智能体完成后 `send_message` 把结论回传给父会话 → 除非用户明确要求不要再调用 `harness_restart`。根会话的续作指令里还会列出「重启时你派出、已被单独恢复的子会话 id」，避免它重复派活。
 4. **只有调用重启工具的会话能自定义自己重启后做什么**：工具的 `continuation` 只拼进该会话那一条续作指令；其他被恢复的会话（含子智能体）一律只收到标准指令，不会看到别人写的提示。给 `continuation` 时本会话必须在恢复范围里（`self` / `interrupted`，或 `sessions` 包含它），否则工具返回 `continuation-without-self`、不重启——这样调用方还来得及改参数，而不是重启后发现提示没人读。
-5. 投递是**幂等**的：根会话的 `requestId` 固定，`prompt` 内部按它去重；计划逐条落盘，中途再挂也只补没投的。
+5. 投递是**幂等**的：根会话的 `requestId` 固定，`prompt` 内部按它去重；计划逐条落盘，中途再挂也只补没投的。子智能体那条走 `subagents.prompt`（没有 `requestId` 去重），只在「子会话已接受、计划还没写盘」这一瞬间再挂时可能重复投递一次（见「限制」）。
 6. 上限 `maxResumeSessions`（默认 8，**根会话与子智能体合计**，显式 `sessions` 也受这个上限约束）、间隔 `staggerMs`（默认 800ms）、计划 `planTtlMinutes`（默认 60 分钟）。`note` 只在确实会恢复本会话时才承诺「重启后本会话会自动续作」，并给出「恢复 N 个会话（含 M 个子智能体）」。
 
 ## 它是怎么重启的
@@ -152,7 +152,8 @@ plugin_manager install_bundle D:\path\to\dsh-harness-restart
 - 自动拉起在个别环境里可能失败（进程起来、窗口不出现）。日志里能看出来，兜底就是手动双击启动；计划在 TTL 内仍会在下次启动时执行。
 - 客户端在发请求前先读 `GET` 路由校验 Host 版本；旧 Host（或非桌面环境）不执行，避免两半不匹配。
 - 续作会真的发起模型请求（这是目的），一次重启最多恢复 `maxResumeSessions` 个会话（根会话 + 子智能体合计）；如果只想重启不想续作，用 `resume: 'none'`。
-- 子智能体只有 **continuable** 的能续作（它的会话里有 continuation 状态，`send_message` 也能续）；one-shot 子代理、以及父会话本身没被恢复时的子会话，会记 `skipped`（`subagent/not-resumable` / `subagent/parent-unavailable`），不会重试。
+- 子智能体只有 **continuable** 的能续作（它的会话里有 continuation 状态，`send_message` 也能续）；one-shot 子代理、父会话已归档、父会话救不回来（`agents.resume` 失败）时的子会话，会记 `skipped`（`subagent/not-resumable` / `subagent/parent-unavailable`），不会重试。
+- 记 `failed` 的条目（例如 `subagent/delivery-unavailable`、别的暂时性错误）会把计划留在 `executing`，**下一次启动时自动重试**，直到计划过期（`planTtlMinutes`，默认 60 分钟）。`skipped` 不重试。
 
 ## 开发
 

@@ -118,9 +118,10 @@ await ctx.sessionController.prompt({ sessionId, requestId, mode: 'queue', conten
 
 恢复引擎的约束：
 
-- 一条失败不阻塞其它条目：`session/not-found`、`session/agent-busy`（子代理会话）标 `skipped`，其它标 `failed`，都写回执；
+- 一条失败不阻塞其它条目：`session/not-found`、`session/agent-busy`（会话存在但被活跃 agent 占着）、子智能体侧的 `subagent/not-resumable` / `subagent/unauthorized` / `subagent/parent-unavailable` / `subagent/not-found` / `subagent/catalog-diagnostic` 标 `skipped`（不可能成功），其它标 `failed`（暂时性），都写回执；
+- `failed` 会重试：每轮恢复开始先把 `failed` 改回 `pending`（旧错误留在 `lastError`），只要还有 `failed`，计划就保持 `executing`，下一次启动再试一轮，直到计划过期；`skipped` 永不重试；
 - 续作提示按条目生成：工具的 `continuation` 只写进发起重启的会话那一条 `continuationHint`，其他会话拿标准指令；给了 `continuation` 而本会话不在恢复范围时，请求在写计划前就以 `continuation-without-self` 被拒（调用方当时还活着，改参数只需一次）；
-- 子智能体单独处理：重启瞬间在回合中的子会话以 `kind: 'subagent'` + `parentSession` + `delegationDepth` 入计划，按「根 → 浅 → 深」投递；子会话从不直接 `prompt`，而是 `subagents.prompt({ parentSessionId, childSessionId, mode:'continuable', delivery:'queue' })` 由**活着的直接父会话**冷启动（父会话先被续作，才可能活着）。父会话不在计划里（它当时没有开放回合，例如队长已结束回合、队员还在跑）时，先 `agents.resume({ resumeSessionId })` 把它 bare-resume 起来——子会话的结论要回给一个活着的父会话，这一步省不掉；唤醒后的父会话保持空闲，等子会话 `send_message` 来叫醒它。父会话救不回来、one-shot 子代理、旧 Host 没有 `subagents` 服务 → 记 `skipped`；`subagent/delivery-unavailable` 记 `failed`，下次启动再试；
+- 子智能体单独处理：重启瞬间在回合中的子会话以 `kind: 'subagent'` + `parentSession` + `delegationDepth` 入计划，按「父链在上、根在前」投递（`delegationDepth` 缺失时也按 `parentSession` 链排序，孙会话不会抢在子会话前）；子会话从不直接 `prompt`，而是 `subagents.prompt({ parentSessionId, childSessionId, mode:'continuable', delivery:'queue' })` 由**活着的直接父会话**冷启动（父会话先被续作，才可能活着）。父会话不在计划里（它当时没有开放回合，例如队长已结束回合、队员还在跑）时，先 `agents.resume({ resumeSessionId })` 把它 bare-resume 起来——子会话的结论要回给一个活着的父会话，这一步省不掉；唤醒后的父会话保持空闲，等子会话 `send_message` 来叫醒它。**只唤醒根会话**：父会话本身是未被续作的子会话时不重复唤醒（否则会把它发布成新的运行时根）；父会话已归档、抢救时 `session/not-found`、one-shot 子代理、旧 Host 没有 `subagents` 服务 → 记 `skipped`；抢救的其它错误与 `subagent/delivery-unavailable` 记 `failed`，下次启动再试；
 - 每投递一条就重写 `plan.json`，Host 再次挂掉后只补没投的；
 - `at` 未到的任务保持 `pending`，到点后（或下次启动）再投；
 - 上限 `maxResumeSessions`、间隔 `staggerMs`，避免开机瞬间并发十几个模型请求。
@@ -146,7 +147,7 @@ Update for version 0.2.1-rc.5 is not available (latest version: 0.2.2-rc.1, down
 ```json
 {
   "ok": true,
-  "version": "0.4.4",
+  "version": "0.4.5",
   "supported": true,
   "capabilities": ["restart", "resume", "tasks"],
   "lastPlan": { "planId": "rst-…", "at": 0, "finishedAt": 0, "ok": true, "resumed": 2, "tasks": 1 }
