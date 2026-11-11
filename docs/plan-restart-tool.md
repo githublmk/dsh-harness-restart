@@ -87,15 +87,22 @@ $DSH_HOME\harness-restart\
     "cwd": "D:\\codeSpace\\js",
     "agentPreset": "standard"
   },
-  "resume": [                    // 重启后要续作的会话
+  "resume": [                    // 重启后要续作的会话：根会话 + 正在运行的子智能体
     {
       "sessionId": "session-…",
       "cwd": "D:\\codeSpace\\js",
       "agentPreset": "standard",
       "openTurnStartSeq": 812,   // 重启瞬间的开放回合，写下来便于排查
       "lastTurn": 41,
-      "continuationHint": "把刚才的重构收尾",   // 可选，调用方补充
+      "continuationHint": "把刚才的重构收尾",   // 可选，只属于发起重启的会话（工具 continuation）
       "state": "pending"         // pending | delivered | skipped | failed
+    },
+    {
+      "sessionId": "session-子…",
+      "kind": "subagent",        // 根会话没有这个字段
+      "parentSession": "session-…",   // 必须由这个活着的直接父会话冷启动
+      "delegationDepth": 1,
+      "state": "pending"
     }
   ],
   "tasks": [                     // 重启后要执行的自定义任务
@@ -158,14 +165,17 @@ $DSH_HOME\harness-restart\
     "resume": {
       "type": "string",
       "enum": ["interrupted", "self", "none"],
-      "description": "重启后恢复哪些会话。interrupted=重启瞬间处于回合中的根会话（默认）；self=只恢复本会话；none=不恢复。"
+      "description": "重启后恢复哪些会话。interrupted=重启瞬间处于回合中的所有根会话及其正在运行的子智能体（默认）；self=只恢复本会话；none=不恢复。"
     },
     "sessions": {
       "type": "array",
       "items": { "type": "string" },
       "description": "显式恢复这些会话 id（给定时覆盖 resume）。"
     },
-    "continuation": { "type": "string", "description": "给被恢复会话的额外续作提示（会拼进续作指令，可省略）。" },
+    "continuation": {
+      "type": "string",
+      "description": "重启后本会话要做什么（可选）：只拼进调用方自己的续作指令，其他被恢复的会话看不到它；本会话不在恢复范围时返回 continuation-without-self。"
+    },
     "tasks": {
       "type": "array",
       "description": "重启后要执行的任务。",
@@ -199,18 +209,20 @@ $DSH_HOME\harness-restart\
   "restartInMs": 1500,
   "willResume": [{ "sessionId": "session-…", "title": "…" }],
   "tasks": [{ "id": "task-1", "target": "new", "promptBytes": 96 }],
-  "note": "约 1.5 秒后重启；重启完成后本会话会自动收到一条续作指令，无需再次调用本工具。"
+  "note": "约 2 秒后重启；重启完成后本会话会自动收到一条续作指令（恢复 3 个会话（含 2 个子智能体），启动 1 个任务），不需要再次调用本工具。"
 }
 ```
 
-错误码（`ok:false` + `code`）：`desktop-only`、`nested-agent`（子智能体调用）、`plan-busy`、`relaunch-unavailable`（助手没 ready，**什么都没杀**）、`shell-alive`、`not-approved`、`approval-unavailable`（没有应答者，失败关闭）、`invalid-argument`、`store-failed`、`internal`。
+错误码（`ok:false` + `code`）：`desktop-only`、`nested-agent`（子智能体调用）、`plan-busy`、`relaunch-unavailable`（助手没 ready，**什么都没杀**）、`shell-alive`、`not-approved`、`approval-unavailable`（没有应答者，失败关闭）、`continuation-without-self`（给了 `continuation` 但本会话不在恢复范围）、`invalid-argument`、`store-failed`、`internal`。
+
+`continuation` 的归属：它由发起重启的会话书写，描述**那个会话**重启后要做什么，所以只贴在它自己的 `resume` 条目上；其他被恢复的会话只拿标准续作指令。给 `continuation` 时若本会话不在恢复范围（`resume: 'none'`、`sessions` 没包含它、被归档等），工具直接返回 `continuation-without-self` 而不重启：调用方此刻还活着，改参数只需一次；重启后它不会回来，届时任何「提示没投递」的说明都没人读。
 
 **确认（审批）**：默认 `requireApproval: true`，工具体内先调
 `ctx.approval.request({ agent: exec.agent, toolName: 'harness_restart', callId: exec.callId, reason })`：
 
 - `allowed-once` → 继续；
 - `rejected` / `cancelled` → 返回 `not-approved`，不写计划；
-- `unavailable`（无应答者，例如非交互 profile）→ 继续执行（本插件本来就只在桌面交互环境有重启能力），并在结果里注明。
+- `unavailable`（无应答者，例如非交互 profile）→ 返回 `approval-unavailable`，**不写计划**（失败关闭；需要无人值守重启请在 profile 里设 `requireApproval: false`）。
 
 ### 5.2 `harness_restart_status`
 
@@ -247,27 +259,42 @@ $DSH_HOME\harness-restart\
 
 ### 6.2 续作投递（核心）
 
-对每条 `resume` 条目：
+按「根会话 → 浅层子智能体 → 深层子智能体」顺序对每条 `resume` 条目投递：
 
 ```js
 // 1) 幂等标识：同一计划同一条目永远同一个 requestId
-const requestId = `restart-${planId}-${entry.sessionId}`
-// 2) 这条 API 会自己完成：恢复冷会话 → 建 agent → 建 user/message → followup
+const requestId = `restart-${planId}-resume-${entry.sessionId}`
+// 2) 根会话：这条 API 会自己完成：恢复冷会话 → 建 agent → 建 user/message → followup
 //    （sessionController.prompt 内部走 resolveAgent，并按 requestId 去重）
 await ctx.sessionController.prompt({
   sessionId: entry.sessionId,
   requestId,
   mode: 'queue',                       // queue → followup（新回合）
-  content: [{ type: 'text', text: continuationText(entry, plan) }],
+  content: [{ type: 'text', text: continuationText({ plan, entry, language }) }],
 }, signal)
-// 3) 只记“已接受”，不再等回合跑完
+// 3) 子智能体：从不直接 prompt，而是由活着的直接父会话冷启动
+//    父会话没被续作（它当时没有开放回合）时，先 bare-resume 它：子会话的结论只能回给活着的父会话
+if (ctx.agents.get(entry.parentSession) === undefined) {
+  await ctx.agents.resume({ resumeSessionId: entry.parentSession, signal })
+}
+await ctx.subagents.prompt({
+  requestId,
+  parentSessionId: entry.parentSession,   // 必须先恢复父会话，否则 subagent/parent-unavailable
+  childSessionId: entry.sessionId,
+  mode: 'continuable',
+  delivery: 'queue',
+  content: [{ type: 'text', text: continuationText({ plan, entry, language }) }],
+}, signal)
+// 4) 只记“已接受”，不再等回合跑完
 ```
 
 要点：
 
+- `continuationHint` 是**逐条目**的：只有发起重启的会话自己那条带工具给的 `continuation`，其余条目为 `undefined`，续作文案因此按条目生成，而不是按计划生成。
 - 用 `ctx.sessionController.prompt` 而不是自己拼消息：它负责 resume、`user-rpc` 来源、按 `requestId` 去重、附件/文件回执校验，且 agent 的生命周期归 Session Controller（不会随本插件卸载而析构）。
 - `mode: 'queue'` → `agent.followup(...)`：空闲则立刻起回合，忙则排在下一回合；不会打断用户正在输入的内容。
-- 失败分类：`session/not-found`、`session/agent-busy`（子代理会话）、`session/writer-held`、`gateway/internal` → 记录回执并继续下一条；本条目 `failed`，不阻塞其它条目。
+- 失败分类：`session/not-found`、`session/agent-busy`、`session/writer-held`、`gateway/internal` → 记录回执并继续下一条；本条目 `failed`，不阻塞其它条目。子智能体侧不重试的是 `subagent/not-resumable`（one-shot 或没有 continuation 状态）、`subagent/unauthorized`、`subagent/parent-unavailable`、`subagent/not-found`、`subagents-unavailable`（旧 Host），记 `skipped`；`subagent/delivery-unavailable` 只是暂时不可用，记 `failed`，开机重跑时再试。
+- 已知的窄窗口：`subagents.prompt` 没有 `requestId` 去重（根会话那条有），如果 Host 恰好在“子会话已接受、计划还没写盘”之间再次挂掉，下一次启动可能把同一条续作再投一次。窗口只有一次写盘的时间，文案本身是幂等的（子会话会看到重复的重启说明）。
 
 ### 6.3 续作指令文案
 
@@ -287,6 +314,10 @@ await ctx.sessionController.prompt({
 ```
 
 `{reason}` 只在工具路径存在；按钮路径写「用户点击了重启」。
+
+**子智能体收到的是另一版**（`entry.kind === 'subagent'`）：开头点明「你是被这次重启打断的子智能体会话，直接父会话是 `<parentSession>`」，结尾要求「完成后用 `send_message` 把结论和产出发给父会话」——子会话的结论只能回到父会话，没有别的读者。
+
+**根会话的文案**在末尾多一段：`重启时你派出的 N 个子智能体也在执行中被打断，重启后会被各自单独恢复：1. [子会话] <id> …`，并叮嘱「不要重复派同样的活，也不要替它们收尾」。
 
 ### 6.4 自定义任务投递
 
@@ -418,9 +449,9 @@ CHANGELOG.md             改：0.4.0
 **单测（`node --test`，无需 harness）**
 
 - 计划：编码/解码、原子写、TTL、状态机非法转换、锁互斥与陈旧锁回收、回执追加与摘要、历史裁剪。
-- 策略：给定活会话集合（含子代理、归档、无开放回合）与不同 `resume` 参数 → 期望子集；上限截断顺序；`self`/`none`/显式数组；`turnBoundaryOf` 缺失时退回 `turnBoundary` 投影、再退回 `Agent.status`。
+- 策略：给定活会话集合（含子代理、归档、无开放回合）与不同 `resume` 参数 → 期望子集；上限截断顺序；`self`/`none`/显式数组；`turnBoundaryOf` 缺失时退回 `turnBoundary` 投影、再退回 `Agent.status`；`continuation` 只落在发起会话那条条目上，本会话不在范围时拒绝。
 - 文案：zh/en、含/不含 reason、含/不含 tasks。
-- 恢复引擎（假 sessionController）：投递参数（`requestId` 稳定、`mode:'queue'`）、错误码分类、stagger、幂等（同一计划跑两次只投一次）、`at` 未到保持 pending、`armed` 计划不执行、过期计划不执行。
+- 恢复引擎（假 sessionController）：投递参数（`requestId` 稳定、`mode:'queue'`）、错误码分类、stagger、幂等（同一计划跑两次只投一次）、`at` 未到保持 pending、`armed` 计划不执行、过期计划不执行；子智能体条目先根后子、必须由活着的父会话投递（`subagents.prompt`）、父会话不在 → `skipped`、`subagent/not-resumable` → `skipped`、`subagent/delivery-unavailable` → `failed`、旧 Host 无 `subagents` 服务 → `skipped`。
 - 工具：定义与 schema、审批开关与四种结局、守卫顺序（子智能体→参数→桌面端）、status/cancel（含「取消要拿锁」）。
 - 助手：参数解析（坏 pid → unknown）、进程表解析（列精确匹配）、拉起判定（未知不重复启动）。
 - Host 入口：路由/工具挂载、GET 握手字段、POST 鉴权与 `desktop-only`、诊断路由的 header 闸、两半 `VERSION` 一致。
@@ -453,7 +484,9 @@ CHANGELOG.md             改：0.4.0
 ## 15. 已确认的决定
 
 1. **默认恢复范围**：`interrupted` —— 重启瞬间处于回合中的所有根会话。
-2. **工具审批卡**：保留（`requireApproval: true`，`ctx.approval` 返回 `rejected`/`cancelled` 才拒绝，`unavailable` 放行）。
+2. **工具审批卡**：保留（`requireApproval: true`；`rejected` / `cancelled` → `not-approved`，没有应答者 `unavailable` → `approval-unavailable`，都失败关闭，不写计划）。
 3. **按钮也加自定义任务**：气泡里同时提供恢复开关与任务输入框（P1 一并交付）。
 4. **续作文案语言**：跟随对话语言（`continuationLanguage: auto`，可强制 `zh`/`en`）。
-5. **交付**：本地提交，沿用仓库作者 `githublmk`，不推送远端。
+5. **续作提示的归属**：`continuation` 只属于发起重启的会话（只拼进它自己的续作指令），其他被恢复的会话只收到标准指令；本会话不在恢复范围时按 `continuation-without-self` 拒绝。
+6. **子智能体也恢复**：重启瞬间正在回合中的子智能体一并写进计划，开机后按「根 → 浅 → 深」顺序由活着的直接父会话经 `subagents.prompt` 冷启动续作；父会话没回来、或子会话不是 continuable 时记 `skipped`，不重试。上限 `maxResumeSessions` 把根会话与子智能体合计算。
+7. **交付**：本地提交，沿用仓库作者 `githublmk`，不推送远端。

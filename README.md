@@ -10,7 +10,7 @@
   - 勾选「重启后继续被中断的会话」（默认勾选）；
   - 填写「重启后任务」（每行一条，可选）。
 - **Agent 工具**：`harness_restart` / `harness_restart_status` / `harness_restart_cancel`，让模型自己发起重启并描述重启后要做什么。
-- **自动续作**：重启瞬间正处在回合中的所有根会话，开机后各自收到一条续作指令，从日志里的最后一个检查点继续，**不重做已完成的工作**。
+- **自动续作**：重启瞬间正处在回合中的所有根会话**以及它们正在运行的子智能体**，开机后各自收到一条续作指令，从日志里的最后一个检查点继续，**不重做已完成的工作**；子智能体由它的父会话冷启动恢复，完成后用 `send_message` 把结论回传给父会话。
 - **重启后任务**：默认各开一个新会话（可指定 cwd / 预设 / 标题 / 执行时间），也可以发到指定会话。
 - **可观测**：计划、逐条回执、失败原因都在磁盘上；重启完成后的页面会提示「已恢复 N 个会话，启动 M 个任务」。
 
@@ -40,7 +40,7 @@
 | `reason` | 为什么要重启；写进计划、续作指令和日志 |
 | `resume` | `interrupted`（默认，重启瞬间在回合中的所有根会话）／`self`（只本会话）／`none` |
 | `sessions` | 显式恢复的会话 id 列表（给定时覆盖 `resume`） |
-| `continuation` | 给被恢复会话的额外提示（拼进续作指令） |
+| `continuation` | 重启后**本会话**要做什么：只拼进调用方自己的续作指令，其他被恢复的会话看不到它 |
 | `tasks[]` | `{ prompt, title?, newSession?, sessionId?, cwd?, agentPreset?, at? }`；重启后执行 |
 | `dryRun` | `true` 只回报计划，不重启 |
 
@@ -48,7 +48,7 @@
 
 - 调用前弹 **审批卡**（`ctx.approval`，可用 `requireApproval: false` 关掉）。用户拒绝/取消则不重启；没有可用应答者时也**不会**重启（返回 `approval-unavailable`，提示用户点标题栏按钮）。只有**根会话**能发起（子智能体调用返回 `nested-agent`）。
 - 审批通过后：写计划 → 启动 `relaunch.mjs` 并等 ready 标记 → 返回工具结果 → **约 1.5 秒后** flush 活会话并停壳。延迟是为了让这次工具结果先落进会话日志。
-- 返回 `{ ok, planId, restarting, restartInMs, willResume[], tasks[], note }`；失败返回 `{ ok:false, code, message }`，常见 `desktop-only` / `plan-busy` / `relaunch-unavailable` / `shell-alive` / `not-approved`。
+- 返回 `{ ok, planId, restarting, restartInMs, willResume[], tasks[], note }`；失败返回 `{ ok:false, code, message }`，常见 `desktop-only` / `plan-busy` / `relaunch-unavailable` / `shell-alive` / `not-approved` / `continuation-without-self`。
 
 ### `harness_restart_status`
 
@@ -60,13 +60,14 @@
 
 ## 重启后自动续作
 
-1. 重启前把「重启瞬间正在回合中的根会话」写进计划（`agents.roots()` + `turnBoundaryOf(session).openTurnStartSeq`，子代理会话和已正常结束/被用户中止的回合不会被选中）。
-2. 新 Host 启动约 1.5 秒后读计划，对每个会话调用
-   `sessionController.prompt({ sessionId, requestId: 'restart-<planId>-<session>', mode:'queue', content:[续作指令] })`。
-   这条 API 自己负责恢复冷会话、重建 Agent、写入 user 消息并 `followup`。
-3. 续作指令明确写着：先复述进度 → 从检查点继续 → 已完成的不重做 → 除非用户明确要求不要再调用 `harness_restart`。
-4. 投递是**幂等**的：每条目的 `requestId` 固定，`prompt` 内部按它去重；计划逐条落盘，中途再挂也只补没投的。
-5. 上限 `maxResumeSessions`（默认 8，显式 `sessions` 也受这个上限约束）、间隔 `staggerMs`（默认 800ms）、计划 `planTtlMinutes`（默认 60 分钟）。
+1. 重启前把「重启瞬间正在回合中的会话」写进计划：根会话和它们正在运行的子智能体（`agents.roots()` + `agents.list()`，用 `turnBoundaryOf(session).openTurnStartSeq` 判断是否在回合中；子代理以 `parentSession` + `delegationDepth` 记录归属，已正常结束/被用户中止的回合不会被选中）。
+2. 新 Host 启动约 1.5 秒后读计划，先按「根会话 → 浅层子智能体 → 深层子智能体」的顺序投递：
+   - 根会话：`sessionController.prompt({ sessionId, requestId: 'restart-<planId>-<session>', mode:'queue', content:[续作指令] })`，这条 API 自己负责恢复冷会话、重建 Agent、写入 user 消息并 `followup`。
+   - 子智能体：`subagents.prompt({ requestId, parentSessionId, childSessionId, mode:'continuable', delivery:'queue', content:[续作指令] })`。子智能体从不被直接 prompt——Host 只允许从**活着的直接父会话**冷启动子会话，所以父会话必须先恢复；父会话当时没有开放回合（例如队长已结束回合、队员还在跑）时会先用 `agents.resume` 把它单独唤醒，让它接得住子会话的结论。父会话救不回来、或子会话不是 continuable（one-shot）时该条目记 `skipped`，不会重试。
+3. 续作指令明确写着：先复述进度 → 从检查点继续 → 已完成的不重做 → 子智能体完成后 `send_message` 把结论回传给父会话 → 除非用户明确要求不要再调用 `harness_restart`。根会话的续作指令里还会列出「重启时你派出、已被单独恢复的子会话 id」，避免它重复派活。
+4. **只有调用重启工具的会话能自定义自己重启后做什么**：工具的 `continuation` 只拼进该会话那一条续作指令；其他被恢复的会话（含子智能体）一律只收到标准指令，不会看到别人写的提示。给 `continuation` 时本会话必须在恢复范围里（`self` / `interrupted`，或 `sessions` 包含它），否则工具返回 `continuation-without-self`、不重启——这样调用方还来得及改参数，而不是重启后发现提示没人读。
+5. 投递是**幂等**的：根会话的 `requestId` 固定，`prompt` 内部按它去重；计划逐条落盘，中途再挂也只补没投的。
+6. 上限 `maxResumeSessions`（默认 8，**根会话与子智能体合计**，显式 `sessions` 也受这个上限约束）、间隔 `staggerMs`（默认 800ms）、计划 `planTtlMinutes`（默认 60 分钟）。`note` 只在确实会恢复本会话时才承诺「重启后本会话会自动续作」，并给出「恢复 N 个会话（含 M 个子智能体）」。
 
 ## 它是怎么重启的
 
@@ -150,7 +151,8 @@ plugin_manager install_bundle D:\path\to\dsh-harness-restart
 - 客户端 bundle 是 Host 激活时的内存快照，改 `client.js` **必须重开应用**，刷新页面不够。
 - 自动拉起在个别环境里可能失败（进程起来、窗口不出现）。日志里能看出来，兜底就是手动双击启动；计划在 TTL 内仍会在下次启动时执行。
 - 客户端在发请求前先读 `GET` 路由校验 Host 版本；旧 Host（或非桌面环境）不执行，避免两半不匹配。
-- 续作会真的发起模型请求（这是目的），一次重启最多恢复 `maxResumeSessions` 个会话；如果只想重启不想续作，用 `resume: 'none'`。
+- 续作会真的发起模型请求（这是目的），一次重启最多恢复 `maxResumeSessions` 个会话（根会话 + 子智能体合计）；如果只想重启不想续作，用 `resume: 'none'`。
+- 子智能体只有 **continuable** 的能续作（它的会话里有 continuation 状态，`send_message` 也能续）；one-shot 子代理、以及父会话本身没被恢复时的子会话，会记 `skipped`（`subagent/not-resumable` / `subagent/parent-unavailable`），不会重试。
 
 ## 开发
 

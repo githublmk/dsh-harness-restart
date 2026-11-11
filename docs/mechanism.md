@@ -59,7 +59,7 @@ function artifactRevision(baseline) {
 
 1. 只允许桌面 Host（`process.versions.electron` + 合法 `ppid`）；
 2. 抢 `restart.lock`（已有活跃计划则 `plan-busy`）；
-3. 快照「重启瞬间正在回合中的根会话」：`ctx.agents.roots()` + `ctx.agents.turnBoundaryOf(session).openTurnStartSeq`（子代理不在 `roots()` 里；正常结束或被用户中止的回合 `openTurnStartSeq` 为 `null`）；
+3. 快照「重启瞬间正在回合中的会话」：根会话取 `ctx.agents.roots()`，正在运行的子智能体取 `ctx.agents.list()` 里的非根条目；两者都用 `turnBoundaryOf(session).openTurnStartSeq` 判断是否在回合中（正常结束或被用户中止的回合为 `null`）。子条目记下 `parentSession` 与 `delegationDepth`，因为恢复时只能由它的父会话冷启动；
 4. 组装计划并**原子写** `$DSH_HOME/harness-restart/plan.json`（tmp + `fsync` + rename）；
 5. 启动 `relaunch.mjs` 并等 ready 标记（拿不到就删计划、返回 `relaunch-unavailable`，**壳不动**）；
 6. 计划改 `restarting`、写 `plan` 回执，返回给调用方；
@@ -119,6 +119,8 @@ await ctx.sessionController.prompt({ sessionId, requestId, mode: 'queue', conten
 恢复引擎的约束：
 
 - 一条失败不阻塞其它条目：`session/not-found`、`session/agent-busy`（子代理会话）标 `skipped`，其它标 `failed`，都写回执；
+- 续作提示按条目生成：工具的 `continuation` 只写进发起重启的会话那一条 `continuationHint`，其他会话拿标准指令；给了 `continuation` 而本会话不在恢复范围时，请求在写计划前就以 `continuation-without-self` 被拒（调用方当时还活着，改参数只需一次）；
+- 子智能体单独处理：重启瞬间在回合中的子会话以 `kind: 'subagent'` + `parentSession` + `delegationDepth` 入计划，按「根 → 浅 → 深」投递；子会话从不直接 `prompt`，而是 `subagents.prompt({ parentSessionId, childSessionId, mode:'continuable', delivery:'queue' })` 由**活着的直接父会话**冷启动（父会话先被续作，才可能活着）。父会话不在计划里（它当时没有开放回合，例如队长已结束回合、队员还在跑）时，先 `agents.resume({ resumeSessionId })` 把它 bare-resume 起来——子会话的结论要回给一个活着的父会话，这一步省不掉；唤醒后的父会话保持空闲，等子会话 `send_message` 来叫醒它。父会话救不回来、one-shot 子代理、旧 Host 没有 `subagents` 服务 → 记 `skipped`；`subagent/delivery-unavailable` 记 `failed`，下次启动再试；
 - 每投递一条就重写 `plan.json`，Host 再次挂掉后只补没投的；
 - `at` 未到的任务保持 `pending`，到点后（或下次启动）再投；
 - 上限 `maxResumeSessions`、间隔 `staggerMs`，避免开机瞬间并发十几个模型请求。
@@ -144,7 +146,7 @@ Update for version 0.2.1-rc.5 is not available (latest version: 0.2.2-rc.1, down
 ```json
 {
   "ok": true,
-  "version": "0.4.2",
+  "version": "0.4.4",
   "supported": true,
   "capabilities": ["restart", "resume", "tasks"],
   "lastPlan": { "planId": "rst-…", "at": 0, "finishedAt": 0, "ok": true, "resumed": 2, "tasks": 1 }
@@ -173,6 +175,7 @@ Update for version 0.2.1-rc.5 is not available (latest version: 0.2.2-rc.1, down
 | 只有 `shell gone` 而完全没有 `relauncher:` 行 | 助手根本没起来（`%TEMP%` 不可写等） | 看同目录 `launch-*.err.log`；手动启动应用即可，计划会在 TTL 内继续执行 |
 | `host: restore: sessionController unavailable; plan kept for the next start` | 恢复时服务没就绪 | 计划保留；下次启动再试 |
 | `host: restore: resume <id> -> skipped` | 会话不存在/归子代理 | 正常；回执里有 `session/not-found` 或 `session/agent-busy` |
+| `host: restore: resume <id> (subagent) -> skipped` | 子会话不可续作，或父会话没回来 | 回执里看 `subagent/not-resumable` / `subagent/parent-unavailable` / `subagents-unavailable`；要它继续只能让父会话重新派活 |
 | `client-probe.log` 里 `resolved` 与界面语言不符 | 语言来源判定问题 | 看同一行的 `hints` |
 
 ## 0.4.0 的加固点

@@ -62,6 +62,34 @@ test('continuationText states the restart, forbids redoing work, and forbids a l
   assert.match(text, /不要再次调用 harness_restart/u)
 })
 
+test('continuationText speaks to an interrupted subagent and tells its parent', () => {
+  const plan = {
+    planId: 'rst-1',
+    createdAt: 1762660872000,
+    reason: '',
+    tasks: [],
+    resume: [
+      { sessionId: 'session-root', kind: 'root' },
+      { sessionId: 'session-child', kind: 'subagent', parentSession: 'session-root' },
+    ],
+  }
+  const child = continuationText({ plan, entry: plan.resume[1], language: 'zh' })
+  assert.match(child, /子智能体会话/u)
+  assert.match(child, /send_message/u)
+  assert.match(child, /session-root/u)
+  assert.match(child, /不要再次调用 harness_restart/u)
+
+  const root = continuationText({ plan, entry: plan.resume[0], language: 'zh' })
+  assert.match(root, /1 个子智能体/u)
+  assert.match(root, /session-child/u)
+  assert.match(root, /不要重复派同样的活/u)
+
+  const en = continuationText({ plan, entry: plan.resume[1], language: 'en' })
+  assert.match(en, /^\[harness-restart\] The Host just restarted/u)
+  assert.match(en, /subagent Session/u)
+  assert.match(en, /send_message/u)
+})
+
 test('continuationText has an English form', () => {
   const text = continuationText({
     plan: { planId: 'rst-1', createdAt: Date.now(), reason: 'load new code', tasks: [] },
@@ -79,6 +107,27 @@ test('restartNote distinguishes a dry run from an armed restart', () => {
   assert.match(restartNote({ restartInMs: 1500, resumeCount: 2, taskCount: 1, language: 'zh' }), /恢复 2 个会话/u)
   assert.match(restartNote({ dryRun: true, resumeCount: 0, taskCount: 0, language: 'zh' }), /演练完成：没有重启/u)
   assert.match(restartNote({ restartInMs: 3000, resumeCount: 1, taskCount: 0, language: 'en' }), /Restarting in about 3s/u)
+})
+
+test('restartNote promises a continuation only to a Session that is resumed', () => {
+  const zh = restartNote({ restartInMs: 1500, resumeCount: 1, taskCount: 0, language: 'zh', selfResumed: false })
+  assert.match(zh, /不会自动续作/u)
+  assert.match(zh, /恢复 1 个会话/u)
+  assert.doesNotMatch(zh, /自动收到一条续作指令/u)
+  const en = restartNote({ restartInMs: 1500, resumeCount: 1, taskCount: 0, language: 'en', selfResumed: false })
+  assert.match(en, /not continue automatically/u)
+})
+
+test('restartNote counts the subagents inside the resumed sessions', () => {
+  const note = restartNote({ restartInMs: 1500, resumeCount: 3, subagentCount: 2, taskCount: 1, language: 'zh' })
+  assert.match(note, /恢复 3 个会话（含 2 个子智能体）/u)
+  const en = restartNote({ restartInMs: 1500, resumeCount: 3, subagentCount: 2, taskCount: 1, language: 'en' })
+  assert.match(en, /3 session\(s\) \(2 subagent\(s\)\)/u)
+})
+
+test('errorText explains a continuation whose own Session is not resumed', () => {
+  assert.match(errorText('continuation-without-self', 'zh'), /只作用于发起重启的会话/u)
+  assert.match(errorText('continuation-without-self', 'en'), /applies only to the Session/u)
 })
 
 test('errorText covers every stable code and degrades for unknown ones', () => {

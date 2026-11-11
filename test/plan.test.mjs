@@ -45,6 +45,22 @@ test('createPlan fills the durable shape and keeps entries pending', () => {
   assert.equal(plan.policy.resume, 'interrupted')
 })
 
+test('createPlan keeps a continuation hint and the subagent lineage on its own entry only', () => {
+  const plan = createPlan({
+    resume: [
+      { sessionId: 'session-root', continuationHint: '  把重构收尾  ' },
+      { sessionId: 'session-child', kind: 'subagent', parentSession: 'session-root', delegationDepth: 1 },
+    ],
+    now: 1000,
+  })
+  assert.equal(plan.resume[0].continuationHint, '把重构收尾')
+  assert.equal('continuationHint' in plan.resume[1], false)
+  assert.equal(plan.resume[1].kind, 'subagent')
+  assert.equal(plan.resume[1].parentSession, 'session-root')
+  assert.equal(plan.resume[1].delegationDepth, 1)
+  assert.equal('kind' in plan.resume[0], false)
+})
+
 test('newPlanId sorts by request time and is unique enough', () => {
   const first = newPlanId(1762660872000)
   const second = newPlanId(1762660872000)

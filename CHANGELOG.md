@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.4
+
+- **恢复范围包含子智能体**：重启瞬间正在回合中的子会话也会入计划（`kind: 'subagent'` + `parentSession` + `delegationDepth`），开机后按「根 → 浅 → 深」投递；子会话从不直接 `prompt`，而是由**活着的直接父会话**经 `subagents.prompt({ mode:'continuable', delivery:'queue' })` 冷启动，这正是 Host 允许的唯一路径。
+- 父会话没回来、子会话不可续作（one-shot）、或旧 Host 没有 `subagents` 服务 → 该条目记 `skipped`（`subagent/parent-unavailable` / `subagent/not-resumable` / `subagents-unavailable`），不重试；`subagent/delivery-unavailable` 记 `failed`，下次启动再试。
+- 续作文案分两版：子智能体版要求「完成后用 `send_message` 把结论发回父会话」；根会话版列出「重启时你派出、已被单独恢复的子会话 id」，避免重复派活。
+- 工具先做静态矛盾检查：`continuation` 与 `resume: 'none'`（或 `sessions` 不含本会话）互斥时，在弹审批卡**之前**就返回 `continuation-without-self`，不再让用户先批准一次注定中止的重启。
+- `restartNote` / `willResume` 带上子智能体信息：`note` 写「恢复 N 个会话（含 M 个子智能体）」，`willResume` 每条带 `kind`。
+- 文档：README(.en)、`docs/mechanism.md`、`docs/plan-restart-tool.md` 同步子智能体恢复路径、错误分类与「已知窄窗口」（`subagents.prompt` 无 `requestId` 去重，Host 恰在两次写盘之间再挂可能重复投递一次）；顺手修掉审批 `unavailable` 的旧描述（实际是 `approval-unavailable` 失败关闭）。
+- 单测：子智能体候选（含无父会话的孤儿被排除）、根先于子的投递顺序、父会话不在即 `skipped`、`not-resumable` / `delivery-unavailable` 的分类、旧 Host 降级、计划里提示与血缘只落在各自条目。
+- 版本握手升到 0.4.4。
+
+## 0.4.3
+
+- 修正 `continuation` 的作用域：它由发起重启的会话书写，现在只拼进**该会话**的续作指令（`resume` 条目上的 `continuationHint`），不再复制给所有被恢复的会话——之前别人的提示会出现在无关会话的续作文案里。
+- 新增失败码 `continuation-without-self`：给了 `continuation` 但本会话不在恢复范围（`resume: 'none'`、`sessions` 未包含它、被归档）时，工具在写计划前就拒绝并说明怎么改，而不是重启后把提示悄悄丢掉。
+- `restartNote` 不再对不会被恢复的会话承诺「重启后本会话会自动续作」。
+- 工具定义、README(.en)、`docs/plan-restart-tool.md`、`docs/mechanism.md` 同步说明「只有调用重启工具的会话能自定义自己重启后做什么」。
+- 单测：续作提示只落在发起会话那一条、本会话不在范围时拒绝、`restartNote` 的新文案与错误码。
+- 版本握手升到 0.4.3。
+
 ## 0.4.2
 
 - 助手不再写第二条 `shell-stopped` 回执：它记录 `relaunch-host-gone`（Host 侧的 `shell-stopped` 保留），回执口径不再重复。

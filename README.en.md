@@ -8,7 +8,7 @@ A **Restart** control and a **restart tool** for the DeepSeek Harness Desktop: r
 
 - **Caption-band button** — right after the panel nav's overflow ("更多"). Its confirmation popover offers "Continue interrupted Sessions after the restart" (on by default) and a "Post-restart tasks" box, one task per line.
 - **Agent tools** — `harness_restart`, `harness_restart_status`, `harness_restart_cancel`.
-- **Automatic continuation** — every root Session that was inside a turn at the moment of the restart receives one continuation instruction afterwards and continues from its last checkpoint without redoing finished work.
+- **Automatic continuation** — every root Session that was inside a turn at the moment of the restart **and the subagents it was running** receives its own continuation instruction afterwards and continues from its last checkpoint without redoing finished work. A subagent is cold-resumed by its parent Session and sends its result back with `send_message`.
 - **Post-restart tasks** — each runs in a new Session (cwd / preset / title / `at` configurable) or in a named Session.
 - **Observability** — the plan, per-entry receipts, and failure reasons live on disk; the page reports "N Session(s) resumed, M task(s) started" once it is back.
 
@@ -23,21 +23,22 @@ A **Restart** control and a **restart tool** for the DeepSeek Harness Desktop: r
 
 | Tool | Purpose |
 | --- | --- |
-| `harness_restart` | Request one restart. Arguments: `reason`, `resume` (`interrupted` default / `self` / `none`), `sessions[]`, `continuation`, `tasks[]`, `dryRun`. |
+| `harness_restart` | Request one restart. Arguments: `reason`, `resume` (`interrupted` default / `self` / `none`), `sessions[]`, `continuation`, `tasks[]`, `dryRun`. `continuation` is the calling Session's own instruction for its next turn; it is never copied into another Session's continuation. |
 | `harness_restart_status` | Read the current plan, the last finished restart, and unfinished entries. |
 | `harness_restart_cancel` | Drop a plan that has not reached the shell-stop stage yet (`armed`). |
 
-`harness_restart` asks the Agent approval service first (disable with `requireApproval: false`). Without an answerer it refuses with `approval-unavailable` instead of restarting unasked, and only a root Session may call it (a subagent gets `nested-agent`). After approval it writes the plan, starts the relaunch assistant, returns its result, and stops the shell about 1.5 s later — the delay exists so the tool result reaches the Session log before the process dies. Failures return `{ ok:false, code, message }` with `desktop-only`, `plan-busy`, `relaunch-unavailable`, `shell-alive`, `not-approved`, `approval-unavailable`, or `invalid-argument`.
+`harness_restart` asks the Agent approval service first (disable with `requireApproval: false`). Without an answerer it refuses with `approval-unavailable` instead of restarting unasked, and only a root Session may call it (a subagent gets `nested-agent`). After approval it writes the plan, starts the relaunch assistant, returns its result, and stops the shell about 1.5 s later — the delay exists so the tool result reaches the Session log before the process dies. Failures return `{ ok:false, code, message }` with `desktop-only`, `plan-busy`, `relaunch-unavailable`, `shell-alive`, `not-approved`, `approval-unavailable`, `continuation-without-self`, or `invalid-argument`.
 
 ## How the continuation works
 
-1. Before the restart, the plan records every live root Session whose turn is open (`agents.roots()` plus `turnBoundaryOf(session).openTurnStartSeq`; subagent children and turns that ended or were deliberately stopped are not selected).
-2. About 1.5 s after the next Host boots, the plan is read and each Session receives
-   `sessionController.prompt({ sessionId, requestId: 'restart-<planId>-<session>', mode: 'queue', content: [continuation] })`,
-   which resumes the cold Session, rebuilds its Agent, appends the user message, and follows up.
-3. The instruction states the restart, asks for a short status recap, forbids redoing finished work, and forbids another restart unless the user asks for one.
-4. Delivery is idempotent: the `requestId` is stable per entry and `prompt` dedupes on it; the plan is written after every entry, so a second death only delivers what is missing.
-5. Bounds: `maxResumeSessions` (8), `staggerMs` (800), `planTtlMinutes` (60).
+1. Before the restart, the plan records every live root Session whose turn is open **and the subagents running under them** (`agents.roots()` plus `agents.list()`, with `turnBoundaryOf(session).openTurnStartSeq` deciding whether a Session is inside a turn; subagents carry `parentSession` and `delegationDepth`). Turns that ended or were deliberately stopped are not selected.
+2. About 1.5 s after the next Host boots, the plan is delivered parents first (roots, then shallow children, then deeper ones):
+   - a root receives `sessionController.prompt({ sessionId, requestId: 'restart-<planId>-<session>', mode: 'queue', content: [continuation] })`, which resumes the cold Session, rebuilds its Agent, appends the user message, and follows up;
+   - a subagent receives `subagents.prompt({ requestId, parentSessionId, childSessionId, mode: 'continuable', delivery: 'queue', content: [continuation] })`. A child is never prompted directly: the Host only continues it from its **live direct parent**, so that parent has to be resumed first. When the parent had no open turn (a lead that stopped while a teammate ran), it is revived on its own with `agents.resume` so it can receive the child's result. A child whose parent cannot be revived, or one that is not continuable (one-shot), is recorded as `skipped` and never retried.
+3. The instruction states the restart, asks for a short status recap, forbids redoing finished work, tells a subagent to return its result to the parent with `send_message`, and forbids another restart unless the user asks for one. A root is also told which of its restarted children are running on their own, so it does not re-delegate the same work.
+4. Only the Session that requested the restart can customise its own next move: `continuation` is attached to that Session's entry alone, and every other resumed Session (subagents included) gets the standard instruction. Supplying `continuation` while that Session is not being resumed (`resume: 'none'`, or `sessions` without it) fails with `continuation-without-self` instead of restarting with a hint nobody would read.
+5. Delivery is idempotent: the `requestId` is stable per entry and `prompt` dedupes on it; the plan is written after every entry, so a second death only delivers what is missing.
+6. Bounds: `maxResumeSessions` (8, counting roots and subagents together), `staggerMs` (800), `planTtlMinutes` (60). The tool's `note` promises a continuation only to a Session the plan actually resumes, and counts the subagents it includes.
 
 ## How the restart works
 
@@ -108,7 +109,8 @@ Timeline logs: `%TEMP%\dsh-harness-restart\` — `restart.log`, `client-probe.lo
 - Live Sessions are flushed before the kill; a flush timeout is logged and never waited on forever (the plan still covers the interruption).
 - The client bundle is an activation-time snapshot, so `client.js` changes need an application restart.
 - In some environments the automatic launch can fail (the process starts, no window appears). The logs show it; the plan still runs on the next start while inside its TTL.
-- The continuation really does start model turns; bound them with `maxResumeSessions`, or pass `resume: 'none'`.
+- The continuation really does start model turns; bound them with `maxResumeSessions` (roots and subagents together), or pass `resume: 'none'`.
+- Only **continuable** subagents can be continued (the ones whose Session carries continuation state and that `send_message` can reach). A one-shot subagent, or a child whose parent Session was not resumed, is recorded as `skipped` (`subagent/not-resumable` / `subagent/parent-unavailable`) and never retried.
 
 ## Development
 

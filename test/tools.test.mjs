@@ -53,6 +53,9 @@ test('createTools exposes the three tools with a plain object output schema', ()
   const restart = created[0]
   assert.deepEqual(restart.parameters.properties.resume.enum, ['interrupted', 'self', 'none'])
   assert.equal(restart.parameters.properties.sessions.items.type, 'string')
+  /* The hint is per-Session: the definition has to say so where the model reads it. */
+  assert.match(restart.parameters.properties.continuation.description, /本会话/u)
+  assert.match(restart.description, /continuation 只写进/u)
 })
 
 test('approvalOutcome honors the switch, the service, and every outcome', async () => {
@@ -103,6 +106,18 @@ test('harness_restart refuses a subagent, then bad arguments, then a non-Desktop
   const badTasks = await restart.execute({ tasks: [{ prompt: '   ' }] }, rootExec())
   assert.equal(badTasks.ok, false)
   assert.equal(badTasks.code, 'invalid-argument')
+
+  /* A hint that already contradicts the resume scope is refused before the
+   * environment check, so no approval card is shown for a doomed restart. */
+  const hintRefused = await restart.execute({ resume: 'none', continuation: '继续' }, rootExec())
+  assert.equal(hintRefused.ok, false)
+  assert.equal(hintRefused.code, 'continuation-without-self')
+  assert.match(hintRefused.message, /continuation/u)
+  const hintOutsideSessions = await restart.execute(
+    { sessions: ['session-other'], continuation: '继续' },
+    rootExec(),
+  )
+  assert.equal(hintOutsideSessions.code, 'continuation-without-self')
 
   /* The test runner is a plain Node process: no Electron, no shell. */
   const desktop = await restart.execute({}, rootExec())

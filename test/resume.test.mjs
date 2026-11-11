@@ -65,6 +65,199 @@ function makePlan(extra = {}) {
   })
 }
 
+/** A plan whose child is listed before its parent on purpose. */
+function makeSubagentPlan() {
+  return createPlan({
+    origin: 'tool',
+    language: 'zh',
+    requestedBy: { sessionId: 'session-root' },
+    resume: [
+      { sessionId: 'session-child', kind: 'subagent', parentSession: 'session-root', delegationDepth: 1 },
+      { sessionId: 'session-root' },
+    ],
+    now: Date.now(),
+  })
+}
+
+test('a running subagent is continued through its parent, after the parent', async () => {
+  const plan = makeSubagentPlan()
+  writePlan(directory, plan)
+  const controller = fakeController()
+  const promptRoot = controller.prompt.bind(controller)
+  let rootLive = false
+  controller.prompt = async (request, signal) => {
+    const value = await promptRoot(request, signal)
+    if (request.sessionId === 'session-root') rootLive = true
+    return value
+  }
+  const agents = { get: (id) => (rootLive && id === 'session-root' ? { id: 'session-root' } : undefined) }
+  const delivered = []
+  const subagents = {
+    async prompt(request) {
+      delivered.push(request)
+      return { messageId: 'message-1' }
+    },
+  }
+  const finished = await executePlan({
+    plan,
+    directory,
+    sessionController: controller,
+    agents,
+    subagents,
+    config: { staggerMs: 0 },
+    language: 'zh',
+    sleep: async () => {},
+  })
+  /* The parent was revived first; only then was the child handed over. */
+  assert.equal(controller.prompts.length, 1)
+  assert.equal(controller.prompts[0].sessionId, 'session-root')
+  assert.equal(delivered.length, 1)
+  assert.equal(delivered[0].parentSessionId, 'session-root')
+  assert.equal(delivered[0].childSessionId, 'session-child')
+  assert.equal(delivered[0].mode, 'continuable')
+  assert.equal(delivered[0].delivery, 'queue')
+  assert.equal(delivered[0].requestId, `restart-${plan.planId}-resume-session-child`)
+  assert.match(delivered[0].content[0].text, /send_message/u)
+  assert.deepEqual(finished.resume.map((entry) => entry.state), ['delivered', 'delivered'])
+})
+
+test('a subagent whose parent did not come back is skipped with a receipt', async () => {
+  const plan = makeSubagentPlan()
+  writePlan(directory, plan)
+  const controller = fakeController()
+  const subagents = {
+    async prompt() {
+      throw new Error('a child must not be prompted without a live parent')
+    },
+  }
+  const finished = await executePlan({
+    plan,
+    directory,
+    sessionController: controller,
+    agents: { get: () => undefined },
+    subagents,
+    config: { staggerMs: 0 },
+    language: 'zh',
+    sleep: async () => {},
+  })
+  assert.equal(finished.resume[0].state, 'skipped')
+  assert.equal(finished.resume[0].error, 'subagent/parent-unavailable')
+  assert.equal(finished.resume[1].state, 'delivered')
+  const receipt = readReceipts(directory, 50)
+    .filter((entry) => entry.type === 'resume' && entry.planId === plan.planId
+      && entry.sessionId === 'session-child')
+    .at(-1)
+  assert.equal(receipt.status, 'skipped')
+  assert.equal(receipt.kind, 'subagent')
+  assert.equal(receipt.parentSession, 'session-root')
+})
+
+test('a subagent is still continued when its idle parent is revived for it', async () => {
+  const plan = makeSubagentPlan()
+  writePlan(directory, plan)
+  const revived = []
+  let rootLive = false
+  const agents = {
+    get: (id) => (rootLive && id === 'session-root' ? { id: 'session-root' } : undefined),
+    async resume(request) {
+      revived.push(request)
+      rootLive = true
+      return { agent: { id: request.resumeSessionId } }
+    },
+  }
+  const delivered = []
+  const finished = await executePlan({
+    plan,
+    directory,
+    sessionController: fakeController(),
+    agents,
+    subagents: { async prompt(request) { delivered.push(request); return { messageId: 'm-1' } } },
+    config: { staggerMs: 0 },
+    language: 'zh',
+    sleep: async () => {},
+  })
+  assert.deepEqual(revived.map((request) => request.resumeSessionId), ['session-root'])
+  assert.equal(delivered.length, 1)
+  assert.equal(delivered[0].childSessionId, 'session-child')
+  assert.deepEqual(finished.resume.map((entry) => entry.state), ['delivered', 'delivered'])
+})
+
+test('a subagent whose parent cannot be revived is skipped', async () => {
+  const plan = makeSubagentPlan()
+  writePlan(directory, plan)
+  const finished = await executePlan({
+    plan,
+    directory,
+    sessionController: fakeController(),
+    agents: {
+      get: () => undefined,
+      async resume() {
+        throw new Error('the session is not resumable')
+      },
+    },
+    subagents: { async prompt() { throw new Error('the parent is missing') } },
+    config: { staggerMs: 0 },
+    language: 'zh',
+    sleep: async () => {},
+  })
+  assert.equal(finished.resume[0].state, 'skipped')
+  assert.equal(finished.resume[0].error, 'subagent/parent-unavailable')
+})
+
+test('an uncontinuable subagent is skipped while a transient failure stays retryable', async () => {
+  const failing = (code) => async () => {
+    const error = new Error(code)
+    error.code = code
+    throw error
+  }
+  const first = makeSubagentPlan()
+  writePlan(directory, first)
+  const skipped = await executePlan({
+    plan: first,
+    directory,
+    sessionController: fakeController(),
+    agents: { get: () => ({ id: 'session-root' }) },
+    subagents: { prompt: failing('subagent/not-resumable') },
+    config: { staggerMs: 0 },
+    language: 'zh',
+    sleep: async () => {},
+  })
+  assert.equal(skipped.resume[0].state, 'skipped')
+  assert.equal(skipped.resume[0].error, 'subagent/not-resumable')
+
+  const second = makeSubagentPlan()
+  writePlan(directory, second)
+  const retried = await executePlan({
+    plan: second,
+    directory,
+    sessionController: fakeController(),
+    agents: { get: () => ({ id: 'session-root' }) },
+    subagents: { prompt: failing('subagent/delivery-unavailable') },
+    config: { staggerMs: 0 },
+    language: 'zh',
+    sleep: async () => {},
+  })
+  assert.equal(retried.resume[0].state, 'failed')
+  assert.equal(retried.resume[0].error, 'subagent/delivery-unavailable')
+})
+
+test('a Host without the subagent service skips the children and keeps the roots', async () => {
+  const plan = makeSubagentPlan()
+  writePlan(directory, plan)
+  const controller = fakeController()
+  const finished = await executePlan({
+    plan,
+    directory,
+    sessionController: controller,
+    config: { staggerMs: 0 },
+    language: 'zh',
+    sleep: async () => {},
+  })
+  assert.equal(finished.resume[0].state, 'skipped')
+  assert.equal(finished.resume[0].error, 'subagents-unavailable')
+  assert.equal(finished.resume[1].state, 'delivered')
+})
+
 test('executePlan delivers continuations and tasks, then finishes', async () => {
   const plan = makePlan()
   writePlan(directory, plan)
@@ -102,7 +295,7 @@ test('executePlan delivers continuations and tasks, then finishes', async () => 
   const existingTaskPrompt = controller.prompts.find((request) => request.requestId === `restart-${plan.planId}-task-task-2`)
   assert.equal(existingTaskPrompt.sessionId, 'session-target')
 
-  const receipts = readReceipts(directory, 50)
+  const receipts = readReceipts(directory, 50).filter((receipt) => receipt.planId === plan.planId)
   assert.equal(receipts.filter((receipt) => receipt.type === 'resume').length, 2)
   assert.equal(receipts.filter((receipt) => receipt.type === 'task').length, 2)
   assert.equal(readPlan(directory).state, STATE.done)
