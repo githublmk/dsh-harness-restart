@@ -34,7 +34,7 @@ window.__ModuleLoader__.load({
     }
 
     /** Version the Host half must report before the action is offered. */
-    const VERSION = '0.4.6'
+    const VERSION = '0.4.7'
     /** Same-origin route the Host half answers (forwarded by the Desktop shell). */
     const ROUTE = '/dsh-harness-restart/restart'
     /** Height of the control, matching one caption panel row. */
