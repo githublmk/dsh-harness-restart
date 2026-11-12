@@ -1,17 +1,19 @@
 /**
  * Client half of the harness-restart bundle.
  *
- * Renders one small control in the Desktop caption band, immediately after the
- * global panel nav's overflow ("更多") launcher, and asks the Host to restart
- * the application. Nothing is rendered in a plain browser page or when the
- * caption band is not there: restarting means stopping the process that serves
- * this page.
+ * Contributes one global panel entry — a row in the sidebar's panel list,
+ * seated right after the memory panel — plus the page that row opens. The page
+ * carries the confirmation: what the restart interrupts, the resume switch, the
+ * post-restart task box, and the action itself. Nothing is drawn over the rest
+ * of the shell: the entry is a normal panel row, so it inherits the row's own
+ * hover, tooltip, selected state and collapse behaviour instead of measuring
+ * the caption band.
  *
- * The control asks the Host for its version before offering the action, so an
+ * The page asks the Host for its version before offering the action, so an
  * outdated Host half (one loaded before this file changed) is never used: that
  * combination would stop the shell without a working relaunch path. The same
- * probe reports the last finished restart, which the control shows once the
- * page is back.
+ * probe reports the last finished restart, which the page lists and the
+ * frame-wide notice repeats once the page is back.
  *
  * @module dsh-harness-restart
  */
@@ -20,58 +22,44 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react')
     const h = React.createElement
-    const { useCallback, useEffect, useState } = React
-    /**
-     * Menu row widget of the platform primitives. Every bundle resolves the
-     * same frozen platform table, so the sidebar's own menu uses it; a carrier
-     * without it falls back to a plain button row.
-     */
-    let MenuItemButton
-    try {
-      ;({ MenuItemButton } = require('@deepseek-ai/dsh-client-ui-primitives'))
-    } catch {
-      MenuItemButton = undefined
-    }
+    const { useCallback, useEffect, useRef, useState } = React
 
     /** Version the Host half must report before the action is offered. */
-    const VERSION = '0.4.7'
+    const VERSION = '0.4.8'
     /** Same-origin route the Host half answers (forwarded by the Desktop shell). */
     const ROUTE = '/dsh-harness-restart/restart'
-    /** Height of the control, matching one caption panel row. */
-    const CONTROL_HEIGHT = 28
-    /** A caption band is a short strip; anything taller is a layout column. */
-    const CAPTION_MAX_HEIGHT = 96
-    /** Below this width only the Web (phone) layout exists, and it has no band. */
-    const CAPTION_MIN_VIEWPORT = 520
-    /** Widest the confirmation popover gets before it must fit the viewport. */
-    const MAX_POPOVER_WIDTH = 360
-    /** Right-hand band reserved for the native window controls. */
-    const WINDOW_CONTROLS_RESERVE = 168
-    /** Locale namespace the strings are registered under. */
-    const NS = 'harness-restart'
+    /** Panel id shared by the sidebar entry and the page it opens. */
+    const PANEL_ID = 'harness-restart'
+    /**
+     * Row position in the panel list. The memory panel claims 900, so 901 puts
+     * the restart immediately after it and still before the overflow launcher.
+     */
+    const PANEL_ORDER = 901
     /** A finished plan older than this is history, not a notification. */
     const NOTICE_TTL_MS = 10 * 60 * 1000
     /** How long the post-restart notice stays on screen. */
     const NOTICE_HIDE_MS = 15000
     /** If the page is still alive this long after a request, the restart failed. */
     const RESTART_WATCHDOG_MS = 20000
-    /** Upper bound on task lines accepted from the popover. */
+    /** Upper bound on task lines accepted from the page. */
     const MAX_TASKS = 8
+    /** Widest the page's centred column gets. */
+    const PAGE_MAX_WIDTH = 720
 
     /** Visible text, per app language; the Client locale service selects one. */
     const TEXT = {
       'zh-CN': {
         label: '重启',
-        menuLabel: '重启应用与 Host',
-        tooltip: '重启应用与 Host（重启后可继续被中断的会话）',
-        title: '重启应用与 Host？',
+        heading: '重启应用与 Host',
+        intro: '重启会结束应用与 Host 进程，然后自动拉起。正在进行的任务会被中断；重启完成后，被中断的会话可以自动继续。',
         body: '正在进行的任务会被中断；重启完成后，被中断的会话会自动继续。',
         bodyNoResume: '正在进行的任务会被中断；本次重启不会恢复被中断的会话。',
         resumeLabel: '重启后继续被中断的会话',
-        tasksLabel: '重启后任务（可选，每行一条）',
+        tasksLabel: '重启后任务（可选，每行一条，最多 {max} 条）',
         tasksPlaceholder: '例如：跑一遍 npm test 并汇报失败摘要',
         cancel: '取消',
         confirm: '重启',
+        retry: '重试',
         busy: '正在重启…',
         failed: '重启请求没有被接受，请稍后再试。',
         outdated: '当前 Host 还是旧版本，先重开一次应用再试。',
@@ -80,19 +68,21 @@ window.__ModuleLoader__.load({
         conflict: '已有一次重启正在进行，稍等它完成（界面会在几秒内重启）。',
         notice: '重启完成：已恢复 {resumed} 个会话，启动 {tasks} 个任务',
         noticeFailed: '上次重启有未完成的条目（已恢复 {resumed} 个会话，启动 {tasks} 个任务）',
+        lastOk: '上次重启已完成：已恢复 {resumed} 个会话，启动 {tasks} 个任务',
+        lastFailed: '上次重启有未完成的条目：已恢复 {resumed} 个会话，启动 {tasks} 个任务',
       },
       en: {
         label: 'Restart',
-        menuLabel: 'Restart app and Host',
-        tooltip: 'Restart the app and Host (interrupted Sessions continue afterwards)',
-        title: 'Restart the app and Host?',
+        heading: 'Restart the app and Host',
+        intro: 'A restart ends the app and Host processes and brings them back up. Running tasks are interrupted; interrupted Sessions can continue automatically afterwards.',
         body: 'Running tasks are interrupted; interrupted Sessions continue automatically after the restart.',
         bodyNoResume: 'Running tasks are interrupted; this restart will not resume interrupted Sessions.',
         resumeLabel: 'Continue interrupted Sessions after the restart',
-        tasksLabel: 'Post-restart tasks (optional, one per line)',
+        tasksLabel: 'Post-restart tasks (optional, one per line, at most {max})',
         tasksPlaceholder: 'For example: run npm test and report the failing summary',
         cancel: 'Cancel',
         confirm: 'Restart',
+        retry: 'Retry',
         busy: 'Restarting…',
         failed: 'The restart request was not accepted. Try again.',
         outdated: 'The running Host is an older version. Restart the app once first.',
@@ -101,6 +91,8 @@ window.__ModuleLoader__.load({
         conflict: 'A restart is already in flight; wait for it to finish (the window comes back in a few seconds).',
         notice: 'Restart finished: {resumed} Session(s) resumed, {tasks} task(s) started',
         noticeFailed: 'The last restart left unfinished entries ({resumed} resumed, {tasks} task(s) started)',
+        lastOk: 'Last restart finished: {resumed} Session(s) resumed, {tasks} task(s) started',
+        lastFailed: 'The last restart left unfinished entries: {resumed} Session(s) resumed, {tasks} task(s) started',
       },
     }
 
@@ -142,14 +134,18 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Active app language. Any Chinese hint wins, because the interfaces this
-     * control sits in are Chinese whenever the app is; otherwise an English
-     * hint is used, and Chinese is the last resort.
+     * Active app language, decided by the first hint that names one. The hints
+     * are ordered most specific first, so an explicit locale-service answer wins
+     * over the document marker and the browser's own language: an app switched
+     * to English stays English on a Chinese-locale machine. Chinese is the last
+     * resort, because the interfaces this page sits in are usually Chinese.
      */
     function language(ctx) {
-      const hints = languageHints(ctx).map((value) => value.toLowerCase())
-      if (hints.some((value) => value.startsWith('zh'))) return 'zh-CN'
-      if (hints.some((value) => value.startsWith('en'))) return 'en'
+      for (const hint of languageHints(ctx)) {
+        const value = hint.toLowerCase()
+        if (value.startsWith('zh')) return 'zh-CN'
+        if (value.startsWith('en')) return 'en'
+      }
       return 'zh-CN'
     }
 
@@ -180,18 +176,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** Register the strings with the Client locale service; never fatal. */
-    function registerStrings(ctx) {
-      for (const id of Object.keys(TEXT)) {
-        try {
-          const dispose = ctx.locale?.register?.(NS, id, TEXT[id])
-          if (typeof dispose === 'function') ctx.effect?.(() => dispose)
-        } catch {
-          /* A locale service that refuses this form falls back to the local table. */
-        }
-      }
-    }
-
     /** Text for the current language, re-read whenever the locale changes. */
     function useText(ctx) {
       const [current, setCurrent] = useState(() => language(ctx))
@@ -213,166 +197,11 @@ window.__ModuleLoader__.load({
       return (key) => table[key] ?? key
     }
 
-    /**
-     * Whether one rectangle is the Desktop caption strip rather than a layout
-     * column. A plain Web page renders the same nav vertically down the left
-     * edge, and on a phone that column starts at the top of the viewport with
-     * the conversation scrolling beside it, so position alone would seat the
-     * fixed control in the middle of the chat. A caption band is short, wide
-     * and fully on screen.
-     * @param band - bounds of the candidate element.
-     * @returns true only for a caption-like strip.
-     */
-    function isCaptionBand(band) {
-      return band.width > 0 && band.height > 0
-        && band.height <= CAPTION_MAX_HEIGHT
-        && band.width >= band.height * 2
-        && band.top < 60
-        && band.right > 0
-    }
-
-    /**
-     * The caption-band element whose right edge the control follows, or null
-     * when this layout has no caption band (a phone or a plain Web page keeps
-     * the same nav as a vertical sidebar column).
-     * @returns the band's bounds, or null.
-     */
-    function captionBand() {
-      if (window.innerWidth < CAPTION_MIN_VIEWPORT) return null
-      /* 0.2.2 wraps every caption entry in a `panelEntry` block, so the shipped
-       * row is no longer a direct child of the nav; the nav's own `panelList`
-       * class is the stable shape, and the old one stays for a 0.2.1 build. */
-      const nav = document.querySelector('nav[class*="panelList"], nav:has(> [class*="panelRow"])')
-      if (nav !== null) {
-        const band = nav.getBoundingClientRect()
-        if (isCaptionBand(band)) {
-          const launcher = nav.querySelector('[aria-haspopup]')
-          const rect = launcher === null ? null : launcher.getBoundingClientRect()
-          return rect !== null && rect.width > 0 && rect.height > 0 ? rect : band
-        }
-      }
-      const menubar = document.querySelector('[data-windows-menu]')
-      if (menubar !== null) {
-        const rect = menubar.getBoundingClientRect()
-        if (isCaptionBand(rect)) return rect
-      }
-      return null
-    }
-
-    /** The seat the fixed control takes when a caption band exists. */
-    function captionAnchor() {
-      const reference = captionBand()
-      if (reference === null) return null
-      return {
-        left: Math.round(reference.right) + 8,
-        top: Math.round(reference.top + (reference.height - CONTROL_HEIGHT) / 2),
-      }
-    }
-
-    /** Whether this layout already carries the caption-band control. */
-    function hasCaptionBand() {
-      return captionBand() !== null
-    }
-
-    /** Center seat for a confirmation opened from the More menu. */
-    function centerSeat() {
-      const width = Math.min(MAX_POPOVER_WIDTH, window.innerWidth - 24)
-      return {
-        left: Math.max(8, Math.round((window.innerWidth - width) / 2)),
-        top: Math.min(200, Math.max(72, Math.round(window.innerHeight * 0.15))),
-      }
-    }
-
-    /**
-     * Overlay controls listening for a More-menu request. The overlay owns the
-     * confirmation dialog, so the menu row only asks it to open.
-     */
-    const openRequests = new Set()
-
-    /** Ask the mounted control to open its confirmation. */
-    function requestOpenFromMenu() {
-      for (const listener of openRequests) listener()
-    }
-
-    /**
-     * One row of the panel list's More menu.
-     * @param icon - leading glyph.
-     * @param label - row text.
-     * @param onSelect - activation handler.
-     * @param separatorBefore - whether the owner's own rows precede this one.
-     */
-    function menuRow(icon, label, onSelect, separatorBefore) {
-      if (MenuItemButton !== undefined) {
-        return h(MenuItemButton, { icon, separatorBefore, onSelect }, label)
-      }
-      return h('button', {
-        type: 'button',
-        role: 'menuitem',
-        onClick: onSelect,
-        style: {
-          display: 'flex', alignItems: 'center', gap: 8, width: '100%',
-          padding: '8px 10px', border: 'none', background: 'transparent',
-          color: 'var(--dsw-alias-label-primary)', font: 'inherit', fontSize: 14,
-          textAlign: 'left', cursor: 'pointer',
-          ...(separatorBefore ? { borderTop: '1px solid var(--dsw-alias-border-l1)' } : {}),
-        },
-      }, icon, h('span', null, label))
-    }
-
-    /**
-     * Build the More-menu row. Layouts without a caption band have no other
-     * seat, and the row opens the same confirmation the caption control does.
-     * @param ctx - the Client root context carrying the locale service.
-     */
-    function createMenuEntry(ctx) {
-      return function RestartMenuEntry(props) {
-        const { entries = [], onDismiss } = props ?? {}
-        /* The Desktop caption band already carries the control. */
-        if (hasCaptionBand()) return null
-        const table = TEXT[language(ctx)] ?? TEXT['zh-CN']
-        return menuRow(glyph(), table.menuLabel, () => {
-          if (typeof onDismiss === 'function') onDismiss()
-          requestOpenFromMenu()
-        }, entries.length > 0)
-      }
-    }
-
-    /**
-     * Track the seat the control occupies, so it stays after the overflow
-     * launcher while the sidebar collapses, the locale changes, or the window
-     * resizes. Hidden when there is no room left of the window controls.
-     */
-    function useAnchor(open) {
-      const [anchor, setAnchor] = useState(null)
-      useEffect(() => {
-        if (typeof document === 'undefined') return undefined
-        let previous = ''
-        const measure = () => {
-          const next = captionAnchor()
-          const room = next !== null && next.left + 104 <= window.innerWidth - WINDOW_CONTROLS_RESERVE
-          const seat = next === null || !room ? '' : `${next.left},${next.top}`
-          if (seat === previous) return
-          /* Keep the control where it is while its popover is open: losing the
-           * seat for one remeasure must not unmount the dialog under the user. */
-          if (seat === '' && open) return
-          previous = seat
-          setAnchor(seat === '' ? null : next)
-        }
-        measure()
-        const timer = window.setInterval(measure, 1000)
-        window.addEventListener('resize', measure)
-        return () => {
-          window.clearInterval(timer)
-          window.removeEventListener('resize', measure)
-        }
-      }, [open])
-      return anchor
-    }
-
-    /** Circular-arrow glyph matching the caption row's icon size. */
-    function glyph() {
+    /** Circular-arrow glyph, drawn at the size the caller asks for. */
+    function glyph(size) {
+      const edge = typeof size === 'number' && size > 0 ? size : 16
       return h('svg', {
-        viewBox: '0 0 24 24', width: 16, height: 16, fill: 'none',
+        viewBox: '0 0 24 24', width: edge, height: edge, fill: 'none',
         stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round',
         strokeLinejoin: 'round', 'aria-hidden': true, style: { flex: 'none' },
       },
@@ -381,18 +210,30 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** One popover action button. */
-    function actionButton(key, label, primary, onClick) {
+    /**
+     * The panel-list entry. The sidebar owns the button, the label and the
+     * selected state around it; this only draws the glyph at the requested
+     * edge, so the row looks exactly like the shipped ones.
+     */
+    function PanelIcon(props) {
+      return glyph(props?.size)
+    }
+
+    /** One page action button. */
+    function pageButton(key, label, primary, onClick, disabled) {
       return h('button', {
         key,
         type: 'button',
+        disabled: disabled === true,
         onClick,
         style: {
-          padding: '5px 12px',
+          padding: '6px 14px',
           borderRadius: 6,
-          cursor: 'pointer',
+          cursor: disabled === true ? 'default' : 'pointer',
           font: 'inherit',
           fontSize: 13,
+          lineHeight: '20px',
+          opacity: disabled === true ? 0.55 : 1,
           ...(primary
             ? { border: 'none', background: 'var(--dsw-alias-state-error-primary)', color: '#fff' }
             : {
@@ -404,47 +245,125 @@ window.__ModuleLoader__.load({
       }, label)
     }
 
-    /**
-     * Build the control bound to this Client context.
-     * @param ctx - the Client root context carrying the locale service.
-     */
-    function createControl(ctx) {
-      /** One submission at a time, even when two clicks land in one frame. */
-      let submitting = false
-      /** The stalled watchdog of the current attempt. */
-      let watchdog
+    /** Read the Host's handshake document: version, support, defaults, last plan. */
+    async function probeHost() {
+      try {
+        const response = await fetch(ROUTE, { headers: { accept: 'application/json' } })
+        if (!response.ok) return { error: 'failed' }
+        const info = await response.json()
+        if (info?.supported === false) return { error: 'unsupported' }
+        if (info?.version !== VERSION) return { error: 'outdated' }
+        return { error: '', info }
+      } catch {
+        return { error: 'failed' }
+      }
+    }
 
-      return function RestartControl() {
+    /**
+     * The last finished plan as the page reports it, or null when there is
+     * nothing recent enough to mention.
+     * @param info - the Host's handshake document.
+     */
+    function recentPlan(info) {
+      const last = info?.lastPlan
+      if (last === null || typeof last !== 'object') return null
+      if (typeof last.finishedAt !== 'number') return null
+      if (Date.now() - last.finishedAt > NOTICE_TTL_MS) return null
+      return {
+        ok: last.ok !== false,
+        resumed: Number.isFinite(last.resumed) ? last.resumed : 0,
+        tasks: Number.isFinite(last.tasks) ? last.tasks : 0,
+      }
+    }
+
+    /** Last-restart copy for one plan summary. */
+    function describePlan(text, plan) {
+      return formatTemplate(plan.ok ? text('lastOk') : text('lastFailed'), {
+        resumed: plan.resumed,
+        tasks: plan.tasks,
+      })
+    }
+
+    /** Top inset for the page head, clearing the macOS window controls. */
+    function pageTopInset() {
+      try {
+        if (document.documentElement?.getAttribute?.('data-platform') === 'darwin') {
+          return 'calc(28px + var(--dsh-frame-top-clearance, 48px))'
+        }
+      } catch {
+        /* no document: the browser default applies */
+      }
+      return '28px'
+    }
+
+    /**
+     * Build the page bound to this Client context.
+     * @param ctx - the Client root context carrying the locale and layout services.
+     */
+    function createPage(ctx) {
+      return function RestartPage() {
         const text = useText(ctx)
-        const [open, setOpen] = useState(false)
-        const anchor = useAnchor(open)
-        const [busy, setBusy] = useState(false)
-        const [error, setError] = useState('')
-        const [hover, setHover] = useState(false)
+        /* One submission at a time, even when two clicks land in one frame, and
+         * per page instance: a panel switch unmounts the page while a POST may
+         * still be in flight, and a lock kept in the module closure would leave
+         * the next mount with a button that silently does nothing. */
+        const submitting = useRef(false)
+        /* The stalled watchdog of the current attempt. */
+        const watchdog = useRef()
+        /* Whether the profile's defaults were already adopted into the form. */
+        const adopted = useRef(false)
+        /* Whether the user edited the form, which freezes the adoption. */
+        const touched = useRef(false)
+        const heading = useRef(null)
+        const [check, setCheck] = useState(null)
         const [resume, setResume] = useState(true)
         const [tasksText, setTasksText] = useState('')
-        const [notice, setNotice] = useState(null)
+        const [busy, setBusy] = useState(false)
+        const [error, setError] = useState('')
+        const [lastPlan, setLastPlan] = useState(null)
         const [maxTasks, setMaxTasks] = useState(MAX_TASKS)
-        /** Seat of a dialog opened from the More menu: no caption band to hang it from. */
-        const [menuSeat, setMenuSeat] = useState(null)
-        /** A More-menu request waiting for the probe; the effect below owns it. */
-        const [menuRequested, setMenuRequested] = useState(false)
 
         useEffect(() => () => {
-          cancelLater(watchdog)
+          cancelLater(watchdog.current)
+          /* Unmounted with a POST in flight: release the lock, or the next mount
+           * would start with `submitting` set and the button doing nothing. */
+          submitting.current = false
+        }, [])
+
+        /* An entry page owns its heading: the panel is a navigation destination,
+         * so the title takes focus when the page opens. */
+        useEffect(() => {
+          try {
+            heading.current?.focus?.({ preventScroll: true })
+          } catch {
+            /* focus is a convenience */
+          }
+        }, [])
+
+        /** Ask the Host again, and adopt the profile's defaults when it answers. */
+        const refresh = useCallback(async () => {
+          const result = await probeHost()
+          setCheck(result)
+          setError(result.error)
+          if (result.error !== '') return
+          const info = result.info ?? {}
+          /* Adopted once: maxTasks only shapes the label and the truncation. */
+          if (!adopted.current) {
+            adopted.current = true
+            if (Number.isInteger(info.maxTasks) && info.maxTasks > 0) setMaxTasks(info.maxTasks)
+          }
+          /* The profile's resume policy is the switch's initial state, and only
+           * for a form the user has not touched yet: a Retry must not silently
+           * revert a choice that would change what the POST sends. */
+          if (!touched.current && typeof info.resumeDefault === 'string') {
+            setResume(info.resumeDefault !== 'none')
+          }
+          setLastPlan(recentPlan(info))
         }, [])
 
         useEffect(() => {
-          if (!open) return undefined
-          const onKey = (event) => {
-            if (event.key === 'Escape') {
-              setOpen(false)
-              setMenuSeat(null)
-            }
-          }
-          window.addEventListener('keydown', onKey)
-          return () => window.removeEventListener('keydown', onKey)
-        }, [open])
+          void refresh()
+        }, [refresh])
 
         /* One report per mount: which language sources the page really exposes.
          * The Host keeps it in a log line; it changes no state. */
@@ -486,66 +405,32 @@ window.__ModuleLoader__.load({
           }
         }, [])
 
-        /* The page is freshly loaded after a restart: if the Host finished a
-         * plan a moment ago, say what it did. */
-        useEffect(() => {
-          let mounted = true
-          let timer
-          ;(async () => {
-            try {
-              const response = await fetch(ROUTE, { headers: { accept: 'application/json' } })
-              const info = await response.json()
-              if (!mounted) return
-              const last = info?.lastPlan
-              if (last === null || typeof last !== 'object' || typeof last.finishedAt !== 'number') return
-              if (Date.now() - last.finishedAt > NOTICE_TTL_MS) return
-              setNotice({
-                ok: last.ok !== false,
-                resumed: Number.isFinite(last.resumed) ? last.resumed : 0,
-                tasks: Number.isFinite(last.tasks) ? last.tasks : 0,
-              })
-              timer = later(() => {
-                if (mounted) setNotice(null)
-              }, NOTICE_HIDE_MS)
-            } catch {
-              /* the notice is optional */
-            }
-          })()
-          return () => {
-            mounted = false
-            cancelLater(timer)
-          }
-        }, [])
-
-        /** Probe the Host: version, support, and the button's own defaults. */
-        const probe = useCallback(async () => {
+        /** Leave the page and show the Conversation again. */
+        const back = useCallback(() => {
           try {
-            const response = await fetch(ROUTE, { headers: { accept: 'application/json' } })
-            if (!response.ok) return { error: 'failed' }
-            const info = await response.json()
-            if (info?.supported === false) return { error: 'unsupported' }
-            if (info?.version !== VERSION) return { error: 'outdated' }
-            return { error: '', info }
+            ctx.layout?.selectPanel?.(null)
           } catch {
-            return { error: 'failed' }
+            /* the layout service is already disposed */
           }
         }, [])
 
         const confirm = useCallback(async () => {
-          if (submitting) return
-          submitting = true
-          setOpen(false)
+          if (submitting.current) return
+          /* Never post against a Host whose handshake did not succeed: the
+           * button is disabled until it does, but a disabled button must not be
+           * the only guard (a scripted click, or a keyboard handler, can reach
+           * this closure anyway). */
+          if (check === null || check.error !== '') return
+          submitting.current = true
           setBusy(true)
           setError('')
-          setNotice(null)
-          cancelLater(watchdog)
-          /* Armed before the request: a hung POST must not leave the control
-           * busy forever with no popover and no way to retry. */
-          watchdog = later(() => {
+          cancelLater(watchdog.current)
+          /* Armed before the request: a hung POST must not leave the page stuck
+           * on "restarting" with no way back. */
+          watchdog.current = later(() => {
             setBusy(false)
             setError('stalled')
-            setOpen(true)
-            submitting = false
+            submitting.current = false
           }, RESTART_WATCHDOG_MS)
           const tasks = tasksText
             .split(/\r?\n/u)
@@ -560,270 +445,246 @@ window.__ModuleLoader__.load({
               body: JSON.stringify({ resume: resume ? 'interrupted' : 'none', tasks, language: language(ctx) }),
             })
             if (!response.ok) {
-              cancelLater(watchdog)
+              cancelLater(watchdog.current)
               setBusy(false)
               setError(response.status === 409 ? 'conflict' : 'failed')
-              setOpen(true)
-              submitting = false
+              submitting.current = false
             }
             /* On success the watchdog stays armed: if the app never restarts, it
-             * clears the busy state instead of leaving a dead control behind. */
+             * clears the busy state instead of leaving a dead page behind. */
           } catch {
-            cancelLater(watchdog)
+            cancelLater(watchdog.current)
             setBusy(false)
             setError('failed')
-            setOpen(true)
-            submitting = false
+            submitting.current = false
           }
-        }, [resume, tasksText, maxTasks])
+        }, [check, resume, tasksText, maxTasks])
 
-        const toggle = useCallback(async () => {
-          if (busy) return
-          if (open) {
-            setOpen(false)
-            return
-          }
-          setError('')
-          const result = await probe()
-          if (result.error !== '') {
-            setError(result.error)
-            setOpen(true)
-            return
-          }
-          const info = result.info ?? {}
-          /* The profile's resume policy is the button's initial state. */
-          if (typeof info.resumeDefault === 'string') setResume(info.resumeDefault !== 'none')
-          if (Number.isInteger(info.maxTasks) && info.maxTasks > 0) setMaxTasks(info.maxTasks)
-          setOpen(true)
-        }, [busy, open, probe])
+        const blocked = check !== null && check.error !== ''
+        const ready = check !== null && check.error === ''
 
-        /* The More menu has no caption control to press: its row asks this
-         * component to open the same confirmation in the middle of the view. */
-        useEffect(() => {
-          const listener = () => {
-            setMenuSeat(centerSeat())
-            setMenuRequested(true)
-          }
-          openRequests.add(listener)
-          return () => {
-            openRequests.delete(listener)
-          }
-        }, [])
-
-        useEffect(() => {
-          if (!menuRequested) return
-          setMenuRequested(false)
-          void toggle()
-        }, [menuRequested])
-
-        const seat = anchor ?? menuSeat
-        if (seat === null) return null
-
-        const popoverWidth = Math.min(MAX_POPOVER_WIDTH, window.innerWidth - 24)
-        const popoverLeft = Math.max(8, Math.min(seat.left, window.innerWidth - popoverWidth - 12))
-        const blocked = error === 'outdated' || error === 'unsupported'
-        /** Dismiss the dialog and forget a More-menu seat so it cannot linger. */
-        const closeDialog = () => {
-          setOpen(false)
-          setMenuSeat(null)
-        }
-
-        const backdrop = open
-          ? h('div', {
-            key: 'backdrop',
-            onClick: () => closeDialog(),
-            style: {
-              position: 'fixed', inset: 0, zIndex: 1190,
-              background: 'transparent', pointerEvents: 'auto',
-            },
-          })
-          : null
-
-        const control = h('button', {
-          key: 'button',
-          type: 'button',
-          title: text('tooltip'),
-          'aria-haspopup': 'dialog',
-          'aria-expanded': open,
-          disabled: busy,
-          onClick: () => { toggle() },
-          onMouseEnter: () => setHover(true),
-          onMouseLeave: () => setHover(false),
-          style: {
-            position: 'fixed',
-            left: seat.left,
-            top: seat.top,
-            height: CONTROL_HEIGHT,
-            boxSizing: 'border-box',
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 6,
-            padding: '0 10px',
-            border: '1px solid transparent',
-            borderRadius: 6,
-            background: hover || open ? 'var(--dsw-alias-bg-layer-1)' : 'transparent',
-            color: hover || open ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)',
-            font: 'inherit',
-            fontSize: 14,
-            lineHeight: `${CONTROL_HEIGHT}px`,
-            whiteSpace: 'nowrap',
-            cursor: busy ? 'default' : 'pointer',
-            opacity: busy ? 0.7 : 1,
-            zIndex: 1200,
-            pointerEvents: 'auto',
-            WebkitAppRegion: 'no-drag',
-          },
-        }, glyph(), h('span', { key: 'label' }, busy ? text('busy') : text('label')))
-
-        const popover = open
-          ? h('div', {
-            key: 'popover',
-            role: 'dialog',
-            'aria-label': text('title'),
-            style: {
-              position: 'fixed',
-              left: popoverLeft,
-              top: seat.top + CONTROL_HEIGHT + 6,
-              width: popoverWidth,
-              maxHeight: Math.max(200, window.innerHeight - seat.top - CONTROL_HEIGHT - 24),
-              overflowY: 'auto',
-              boxSizing: 'border-box',
-              padding: 14,
-              borderRadius: 10,
-              background: 'var(--dsw-alias-bg-overlay)',
-              border: '1px solid var(--dsw-alias-border-l1)',
-              boxShadow: '0 12px 32px rgba(0, 0, 0, 0.18)',
-              color: 'var(--dsw-alias-label-primary)',
-              fontSize: 13,
-              zIndex: 1400,
-              pointerEvents: 'auto',
-              WebkitAppRegion: 'no-drag',
-            },
-          },
-          h('div', {
-            key: 'title',
-            style: { fontSize: 14, fontWeight: 600, marginBottom: 6 },
-          }, text('title')),
+        const card = [
           h('div', {
             key: 'body',
-            style: {
-              color: 'var(--dsw-alias-label-secondary)',
-              lineHeight: 1.6,
-              marginBottom: 10,
-            },
+            style: { color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.7, marginBottom: 14 },
           }, text(resume ? 'body' : 'bodyNoResume')),
           h('label', {
             key: 'resume',
             style: {
               display: 'flex', alignItems: 'center', gap: 8,
-              marginBottom: 10, cursor: 'pointer',
-              color: 'var(--dsw-alias-label-primary)',
+              marginBottom: 16, cursor: busy ? 'default' : 'pointer',
+              color: 'var(--dsw-alias-label-primary)', fontSize: 13,
             },
           },
           h('input', {
             type: 'checkbox',
             checked: resume,
-            onChange: () => setResume(!resume),
+            disabled: busy,
+            onChange: () => {
+              touched.current = true
+              setResume(!resume)
+            },
             style: { margin: 0 },
           }),
           h('span', { key: 'text' }, text('resumeLabel'))),
-          h('div', {
+          h('label', {
             key: 'tasks',
-            style: { marginBottom: error === '' ? 12 : 8 },
+            style: { display: 'block', marginBottom: 14 },
           },
-          h('div', {
+          h('span', {
             key: 'label',
-            style: { color: 'var(--dsw-alias-label-secondary)', marginBottom: 4 },
-          }, text('tasksLabel')),
+            style: {
+              display: 'block',
+              color: 'var(--dsw-alias-label-secondary)',
+              marginBottom: 6,
+              fontSize: 13,
+            },
+          }, formatTemplate(text('tasksLabel'), { max: maxTasks })),
           h('textarea', {
             value: tasksText,
-            onChange: (event) => setTasksText(event?.target?.value ?? ''),
+            disabled: busy,
+            onChange: (event) => {
+              touched.current = true
+              setTasksText(event?.target?.value ?? '')
+            },
             placeholder: text('tasksPlaceholder'),
-            rows: 2,
+            rows: 3,
             style: {
               width: '100%',
               boxSizing: 'border-box',
               resize: 'vertical',
-              padding: '6px 8px',
+              padding: '8px 10px',
               borderRadius: 6,
               border: '1px solid var(--dsw-alias-border-l1)',
               background: 'transparent',
               color: 'var(--dsw-alias-label-primary)',
               font: 'inherit',
               fontSize: 13,
+              lineHeight: 1.6,
             },
           })),
           error === ''
             ? null
             : h('div', {
               key: 'error',
-              style: { color: 'var(--dsw-alias-state-error-primary)', marginBottom: 12 },
+              role: 'alert',
+              style: { color: 'var(--dsw-alias-state-error-primary)', marginBottom: 12, fontSize: 13 },
             }, text(error)),
           h('div', {
             key: 'actions',
             style: { display: 'flex', justifyContent: 'flex-end', gap: 8 },
           },
+          pageButton('cancel', text('cancel'), false, back, busy),
           blocked
-            ? actionButton('close', text('cancel'), false, () => closeDialog())
-            : [
-              actionButton('cancel', text('cancel'), false, () => closeDialog()),
-              actionButton('confirm', text('confirm'), true, () => { confirm() }),
-            ],
+            ? pageButton('retry', text('retry'), false, () => { void refresh() }, busy)
+            : pageButton('confirm', busy ? text('busy') : text('confirm'), true, () => { void confirm() }, busy || !ready),
           ),
-          )
-          : null
+        ]
 
-        const noticeNode = notice === null
+        return h('div', {
+          style: {
+            /* The main panel is a flex column cell with min-height 0; take the
+             * rest of it and scroll, instead of assuming a definite height. */
+            flex: 1,
+            minHeight: 0,
+            minWidth: 0,
+            width: '100%',
+            boxSizing: 'border-box',
+            overflowY: 'auto',
+            /* macOS draws the window buttons over the first row: keep the head
+             * below them, as the shipped entry pages do. */
+            padding: `${pageTopInset()} clamp(24px, 4vw, 48px) 48px`,
+            color: 'var(--dsw-alias-label-primary)',
+          },
+        },
+        h('div', { style: { width: '100%', maxWidth: PAGE_MAX_WIDTH, margin: '0 auto' } },
+        h('h1', {
+          ref: heading,
+          tabIndex: -1,
+          style: { margin: 0, fontSize: 20, fontWeight: 500, lineHeight: '28px', outline: 'none' },
+        }, text('heading')),
+        h('p', {
+          style: {
+            margin: '6px 0 0',
+            color: 'var(--dsw-alias-label-secondary)',
+            fontSize: 13,
+            lineHeight: '20px',
+          },
+        }, text('intro')),
+        lastPlan === null
           ? null
-          : h('div', {
-            key: 'notice',
+          : h('p', {
+            key: 'last',
             role: 'status',
-            onClick: () => setNotice(null),
             style: {
-              position: 'fixed',
-              left: seat.left,
-              top: seat.top + CONTROL_HEIGHT + 6,
-              maxWidth: 380,
-              padding: '4px 10px',
-              borderRadius: 6,
-              background: 'var(--dsw-alias-bg-overlay)',
-              border: '1px solid var(--dsw-alias-border-l1)',
+              margin: '10px 0 0',
               color: 'var(--dsw-alias-label-secondary)',
               fontSize: 12,
-              lineHeight: 1.5,
-              zIndex: 1300,
-              pointerEvents: 'auto',
-              cursor: 'pointer',
-              WebkitAppRegion: 'no-drag',
+              lineHeight: '18px',
             },
-          }, formatTemplate(notice.ok ? text('notice') : text('noticeFailed'), {
-            resumed: notice.resumed,
-            tasks: notice.tasks,
-          }))
+          }, describePlan(text, lastPlan)),
+        h('div', {
+          key: 'card',
+          style: {
+            marginTop: 20,
+            padding: 16,
+            borderRadius: 10,
+            border: '1px solid var(--dsw-alias-border-l1)',
+            background: 'var(--dsw-alias-bg-layer-1)',
+            fontSize: 13,
+          },
+        }, card),
+        ))
+      }
+    }
 
-        return h(React.Fragment, null, backdrop, anchor === null ? null : control, popover, noticeNode)
+    /**
+     * The frame-wide notice: a compact pill that reports a restart finished a
+     * moment ago, then gets out of the way. It owns no button — the restart
+     * itself lives in the panel page — so it hides once there is nothing to say.
+     * @param ctx - the Client root context carrying the locale service.
+     */
+    function createNotice(ctx) {
+      return function RestartNotice() {
+        const text = useText(ctx)
+        const [notice, setNotice] = useState(null)
+
+        useEffect(() => {
+          let mounted = true
+          let timer
+          ;(async () => {
+            try {
+              const response = await fetch(ROUTE, { headers: { accept: 'application/json' } })
+              const info = await response.json()
+              if (!mounted) return
+              const plan = recentPlan(info)
+              if (plan === null) return
+              setNotice(plan)
+              timer = later(() => {
+                if (mounted) setNotice(null)
+              }, NOTICE_HIDE_MS)
+            } catch {
+              /* the notice is optional */
+            }
+          })()
+          return () => {
+            mounted = false
+            cancelLater(timer)
+          }
+        }, [])
+
+        if (notice === null) return null
+
+        return h('div', {
+          role: 'status',
+          /* Purely informational, and it sits over the composer: it must never
+           * swallow a click meant for the page underneath. It hides itself. */
+          style: {
+            position: 'fixed',
+            left: '50%',
+            bottom: 28,
+            transform: 'translateX(-50%)',
+            maxWidth: 'min(520px, calc(100vw - 32px))',
+            padding: '8px 14px',
+            borderRadius: 8,
+            background: 'var(--dsw-alias-bg-overlay)',
+            border: '1px solid var(--dsw-alias-border-l1)',
+            boxShadow: '0 10px 28px rgba(0, 0, 0, 0.16)',
+            color: 'var(--dsw-alias-label-secondary)',
+            fontSize: 12,
+            lineHeight: 1.5,
+            zIndex: 1300,
+            pointerEvents: 'none',
+          },
+        }, formatTemplate(notice.ok ? text('notice') : text('noticeFailed'), {
+          resumed: notice.resumed,
+          tasks: notice.tasks,
+        }))
       }
     }
 
     return {
-      inject: ['slots', 'locale'],
+      /* `layout` is a hard dependency: the row's own click selects the panel,
+       * and Cancel is the page's only way back to the Conversation. */
+      inject: ['slots', 'locale', 'layout'],
       apply(ctx) {
-        registerStrings(ctx)
-        const Control = createControl(ctx)
+        /* The page carries the action; the sidebar row is the entry that opens
+         * it, seated where the user expects a global panel to be. */
+        ctx.slots.inject('main', () => ctx.slots.register({
+          name: 'main',
+          key: PANEL_ID,
+        }, createPage(ctx)))
+        ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+          name: 'sidebar.panellist',
+          id: PANEL_ID,
+          order: PANEL_ORDER,
+          label: () => (TEXT[language(ctx)] ?? TEXT['zh-CN']).label,
+        }, PanelIcon))
         ctx.slots.inject('shell.overlay', () => ctx.slots.register({
           name: 'shell.overlay',
-          id: 'harness-restart',
+          id: 'harness-restart-notice',
           order: 1000,
-          label: 'Restart',
-        }, Control))
-        /* The sidebar shows its "More" menu while this list has rows; on a
-         * Web layout the row is the only way to reach the restart. */
-        ctx.slots.inject('sidebar.panellist.actions', () => ctx.slots.register({
-          name: 'sidebar.panellist.actions',
-          id: 'harness-restart',
-          order: 1000,
-          label: 'Restart',
-        }, createMenuEntry(ctx)))
+        }, createNotice(ctx)))
       },
     }
   },

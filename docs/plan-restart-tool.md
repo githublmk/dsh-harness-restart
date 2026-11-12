@@ -38,7 +38,7 @@
 一条流水线，两个入口：
 
 ```
-入口 A：Agent 工具 harness_restart(...)       入口 B：标题栏按钮 POST /restart
+入口 A：Agent 工具 harness_restart(...)       入口 B：侧边栏「重启」页面 POST /restart
                 └──────────────┬──────────────────────┘
                                ▼
                   ① 组装计划（resume 候选 + tasks）→ 原子落盘
@@ -359,11 +359,13 @@ await ctx.subagents.prompt({
 
 ## 8. 客户端（P1，可与 P0 一起发）
 
-- 确认气泡增加两项（都可折叠，默认不打扰）：
+> 0.4.8 起入口是侧边栏面板行 + 独立页面，不再是标题栏按钮上的确认气泡；下面这段保留当初的设计记录，术语按当时的「气泡」写。
+
+- 确认界面增加两项（都可折叠，默认不打扰）：
   - `☑ 重启后继续被中断的会话`（默认开，对应 `resume: interrupted`）
   - `重启后执行的任务（可选，每行一条）` → `tasks: [{ prompt }]`
-- 挂载时 `GET` 同一路由：若最近一次计划在 10 分钟内完成，显示一行可关闭的提示「已恢复 N 个会话 / 已启动 M 个任务」。
-- 版本握手升级：`GET` 返回 `{ version, supported, capabilities: ['restart','resume','tasks'], resumeDefault, maxTasks, lastPlan }`；`resumeDefault` 预选气泡开关，`maxTasks` 限制任务行数，`lastPlan` 供完成提示。
+- 挂载时 `GET` 同一路由：若最近一次计划在 10 分钟内完成，显示一行提示「已恢复 N 个会话 / 已启动 M 个任务」。
+- 版本握手升级：`GET` 返回 `{ version, supported, capabilities: ['restart','resume','tasks'], resumeDefault, maxTasks, lastPlan }`；`resumeDefault` 预选恢复开关，`maxTasks` 限制任务行数，`lastPlan` 供完成提示。
 - 客户端快照机制不变：改 `client.js` 后仍需要重开一次应用才能看到新 UI（这是 harness 的既有约束，文档里已写明）。
 
 ## 9. 配置
@@ -437,7 +439,7 @@ CHANGELOG.md             改：0.4.0
 5. `index.js` 接线；路由升级（`origin:'button'`、`/status`、能力位、版本 0.4.0）。
 6. 测试 + 文档 + CHANGELOG。
 
-**P1（体验）**：按钮气泡两项（恢复开关 + 任务输入框）、重启完成提示、`/status` 展示。
+**P1（体验）**：确认界面的两项（恢复开关 + 任务输入框）、重启完成提示、`/status` 展示。
 
 **P2（进阶，另开一轮）**：
 
@@ -486,7 +488,7 @@ CHANGELOG.md             改：0.4.0
 
 1. **默认恢复范围**：`interrupted` —— 重启瞬间处于回合中的所有根会话，以及它们正在运行的子智能体（见第 6 条）。
 2. **工具审批卡**：保留（`requireApproval: true`；`rejected` / `cancelled` → `not-approved`，没有应答者 `unavailable` → `approval-unavailable`，都失败关闭，不写计划）。
-3. **按钮也加自定义任务**：气泡里同时提供恢复开关与任务输入框（P1 一并交付）。
+3. **入口也加自定义任务**：确认界面同时提供恢复开关与任务输入框（P1 一并交付；0.4.8 起是侧边栏「重启」页面）。
 4. **续作文案语言**：跟随对话语言（`continuationLanguage: auto`，可强制 `zh`/`en`）。
 5. **续作提示的归属**：`continuation` 只属于发起重启的会话（只拼进它自己的续作指令），其他被恢复的会话只收到标准指令；本会话不在恢复范围时按 `continuation-without-self` 拒绝。
 6. **子智能体也恢复**：重启瞬间正在回合中的子智能体一并写进计划，开机后按「根 → 浅 → 深」顺序由活着的直接父会话经 `subagents.prompt` 冷启动续作；父会话没回来、或子会话不是 continuable 时记 `skipped`，不重试。上限 `maxResumeSessions` 把根会话与子智能体合计算。

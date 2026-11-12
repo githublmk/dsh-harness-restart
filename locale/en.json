@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Restart Harness",
-    "description": "Adds a Restart control to the Desktop caption band, right after the panel nav's overflow: it restarts the app and Host after a confirmation, continues the Sessions it interrupted, and runs post-restart tasks. Ships the harness_restart tools as well."
+    "description": "Adds a Restart entry to the sidebar panel list, right after the memory panel: it opens a page that restarts the app and Host after a confirmation, continues the Sessions it interrupted, and runs post-restart tasks. Ships the harness_restart tools as well."
   }
 }

@@ -2,11 +2,11 @@
 
 给 DeepSeek Harness 桌面端加一个 **重启** 按钮和一个 **重启工具** —— 点一下（二次确认）重启「应用与 Host」，重启完成后**被中断的会话会自动继续**，还可以在重启前排好重启后要执行的任务。
 
-> 桌面端「应用」菜单是 Electron 原生菜单，打包版里没有「重启应用与 Host」这一项（只有开发版有），插件也无法往原生菜单插项。这个 bundle 走另一条路：在标题栏菜单条上放一个自带的重启入口，同时把同一套重启能力做成 Agent 工具。
+> 桌面端「应用」菜单是 Electron 原生菜单，打包版里没有「重启应用与 Host」这一项（只有开发版有），插件也无法往原生菜单插项。这个 bundle 走另一条路：在侧边栏面板列表里加一个「重启」入口（紧跟在「记忆」之后），同时把同一套重启能力做成 Agent 工具。
 
 ## 功能
 
-- **标题栏按钮**：位置紧跟全局面板导航的「更多」启动器；确认气泡里可以
+- **侧边栏「重启」页面**：面板列表里紧跟「记忆」的一行，点开是重启确认页；页面上可以
   - 勾选「重启后继续被中断的会话」（默认勾选）；
   - 填写「重启后任务」（每行一条，可选）。
 - **Agent 工具**：`harness_restart` / `harness_restart_status` / `harness_restart_cancel`，让模型自己发起重启并描述重启后要做什么。
@@ -16,18 +16,11 @@
 
 ## 界面
 
-- **只在桌面端出现**：要求面板导航位于标题栏（`dsh-panel-titlebar` 把侧栏导航搬进标题条的那种布局），或 `[data-windows-menu]` 位于顶部。普通浏览器页面（`dsh web`）不显示——那里的「重启」没有意义。
-- **位置**：紧跟「更多」启动器（`[aria-haspopup]`）右缘 +8px，随侧栏折叠、语言切换、窗口宽度每秒重测；右侧留 168px 给窗口按钮，空间不够时自动隐藏。
-- **交互**：点一下弹出确认气泡（`Esc` 或点空白关闭）：
-
-  > 重启应用与 Host？
-  > 正在进行的任务会被中断；重启完成后，被中断的会话会自动继续。
-  > ☑ 重启后继续被中断的会话
-  > 重启后任务（可选，每行一条）
-  > 　　　　　　　　　　　　　[取消] [重启]
-
-  确认后按钮变成「正在重启…」。请求被拒时气泡重新打开并说明原因；旧 Host 或不支持的环境只给「取消」。
-- **文案**：中英双语。判定顺序是 locale 服务 → 文档 `lang` → `navigator.language`，任一中文提示源优先（细节见 [docs/mechanism.md](docs/mechanism.md#语言解析)）。
+- **入口**：侧边栏面板列表里的一行（`sidebar.panellist`，`order: 901`），紧跟在「记忆」（900）之后、「更多」之前。桌面、Web、手机布局都有这个入口；侧栏折叠成图标栏时它和其它入口一样只显示图标。
+- **页面**：点开是「重启应用与 Host」页面——确认文案、恢复开关、重启后任务、失败原因都在页面上，「取消」回到会话。
+- **只读校验**：页面挂载时先 `GET` 同一路由，确认 Host 版本与是否支持自动重启；旧 Host 或非桌面环境只给「取消」「重试」，绝不发重启请求。
+- **交互**：点「重启」后按钮变成「正在重启…」；请求被拒在页面上说明原因。
+- **文案**：中英双语。判定顺序是 locale 服务 → 文档 `lang` → `navigator.language`，按顺序取第一个能判定语言的来源，都判定不了才退回中文（细节见 [docs/mechanism.md](docs/mechanism.md#语言解析)）。
 
 ## 工具
 
@@ -46,7 +39,7 @@
 
 行为要点：
 
-- 调用前弹 **审批卡**（`ctx.approval`，可用 `requireApproval: false` 关掉）。用户拒绝/取消则不重启；没有可用应答者时也**不会**重启（返回 `approval-unavailable`，提示用户点标题栏按钮）。只有**根会话**能发起（子智能体调用返回 `nested-agent`）。
+- 调用前弹 **审批卡**（`ctx.approval`，可用 `requireApproval: false` 关掉）。用户拒绝/取消则不重启；没有可用应答者时也**不会**重启（返回 `approval-unavailable`，提示用户用侧边栏的「重启」页面）。只有**根会话**能发起（子智能体调用返回 `nested-agent`）。
 - 审批通过后：写计划 → 启动 `relaunch.mjs` 并等 ready 标记 → 返回工具结果 → **约 1.5 秒后** flush 活会话并停壳。延迟是为了让这次工具结果先落进会话日志。
 - 返回 `{ ok, planId, restarting, restartInMs, willResume[], tasks[], note }`；失败返回 `{ ok:false, code, message }`，常见 `desktop-only` / `plan-busy` / `relaunch-unavailable` / `shell-alive` / `not-approved` / `continuation-without-self`。
 
@@ -100,7 +93,7 @@ plugin_manager install_bundle D:\path\to\dsh-harness-restart
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
-| `resume` | `interrupted` | 按钮路径的默认恢复策略；打开气泡时按它预选「继续会话」开关（工具以参数为准） |
+| `resume` | `interrupted` | 页面路径的默认恢复策略；重启页面初次打开时按它预选「继续会话」开关（用户在页面上的改动不会被 Retry 覆盖；工具以参数为准） |
 | `requireApproval` | `true` | 工具是否走 `ctx.approval` 审批卡 |
 | `maxResumeSessions` | `8` | 单次重启最多恢复多少个会话 |
 | `staggerMs` | `800` | 两条续作之间的间隔 |
@@ -109,7 +102,7 @@ plugin_manager install_bundle D:\path\to\dsh-harness-restart
 | `continuationLanguage` | `auto` | `auto` 跟随对话语言；`zh` / `en` 强制 |
 | `flushTimeoutMs` | `3000` | 停壳前 flush 活会话的预算 |
 | `bootDelayMs` | `1500` | 开机后多久开始恢复 |
-| `maxTasks` | `8` | 单次重启最多排多少个任务（也决定气泡里最多接受几行） |
+| `maxTasks` | `8` | 单次重启最多排多少个任务（也决定重启页面最多接受几行任务） |
 | `storeDir` | `null` | 覆盖计划目录（默认 `$DSH_HOME/harness-restart`） |
 
 ### 关闭工具审批（可选）
@@ -122,7 +115,7 @@ plugin_manager install_bundle D:\path\to\dsh-harness-restart
     requireApproval: false
 ```
 
-代价是模型可以在没有卡片的情况下重启应用（标题栏按钮不受影响，它本来就有自己的确认气泡）。改了 patch 后若 profile 开启 `patchReload: live`，通常几秒内生效，否则下次启动生效。
+代价是模型可以在没有卡片的情况下重启应用（侧边栏「重启」页面不受影响，它本来就有自己的确认）。改了 patch 后若 profile 开启 `patchReload: live`，通常几秒内生效，否则下次启动生效。
 
 ## 数据与日志
 
@@ -139,7 +132,7 @@ plugin_manager install_bundle D:\path\to\dsh-harness-restart
 | 文件 | 内容 |
 | --- | --- |
 | `restart.log` | 一次重启的完整时序：`assistant ready` → `shell gone` → `flushed N session(s)` |
-| `client-probe.log` | 客户端挂载时上报的语言来源，排查文案问题用 |
+| `client-probe.log` | 重启页面挂载时上报的语言来源，排查文案问题用 |
 | `launch-N.out.log` / `launch-N.err.log` | 直接启动尝试的 stdout/stderr（走 explorer 路径时不会产生） |
 
 ## 限制与已知问题
@@ -162,7 +155,7 @@ npm run check   # node --check 全部入口与 lib
 npm test        # 计划/策略/文案/恢复引擎单测 + 客户端无头冒烟
 ```
 
-`test/smoke-client.mjs` 用最小 React 替身和假标题栏 DOM 跑真实的 `client.js`；`lib/*` 的单测用真实文件系统（临时目录）与假 `sessionController`，不需要 Harness。
+`test/smoke-client.mjs` 用最小 React 替身和假 Host 跑真实的 `client.js`；`lib/*` 的单测用真实文件系统（临时目录）与假 `sessionController`，不需要 Harness。
 
 ## License
 

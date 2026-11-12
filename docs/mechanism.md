@@ -1,6 +1,6 @@
 # 重启机制与实现约束
 
-这份文档记录实现这个按钮时踩到的三堵墙，以及现在的时序、每一步的验证点和排错方法。所有结论都来自本机（Windows 11 / Electron 44.7.0 / Desktop 0.2.1-rc.5）实测。
+这份文档记录实现这个重启入口时踩到的三堵墙，以及现在的时序、每一步的验证点和排错方法。所有结论都来自本机（Windows 11 / Electron 44.7.0 / Desktop 0.2.1-rc.5）实测。
 
 ## 三堵墙
 
@@ -19,7 +19,7 @@
 ] : [],
 ```
 
-但它被 `development` 包住，**打包版拿不到**；渲染端也只有被 `contextBridge` 白名单暴露的几个 API，没有 `ipcRenderer`。Cordis 插件能做的只是渲染端的东西，所以只能在菜单条上自建入口。
+但它被 `development` 包住，**打包版拿不到**；渲染端也只有被 `contextBridge` 白名单暴露的几个 API，没有 `ipcRenderer`。Cordis 插件能做的只是渲染端的东西，所以只能自建入口——现在这个入口是侧边栏面板列表里的一行（见下一节）。
 
 顺带一提：`app.relaunch()` 这条路径本身是可靠的（崩溃恢复对话框里的「重启」就是它），只是没有 IPC 能从页面或 Host 触发它。
 
@@ -53,9 +53,25 @@ function artifactRevision(baseline) {
 
 所以改 `client.js` 之后：刷新页面**不够**，浏览器只是重新请求同一个（immutable）URL；必须**重开应用**让 Host 重新抓快照。
 
+## 入口为什么是面板行（0.4.8）
+
+0.3.0–0.4.7 的入口是一颗 `position: fixed` 的按钮：挂在 `shell.overlay` 上，自己测量标题栏「更多」启动器的位置。它踩过三次坑，每次都只能靠改选择器续命：
+
+- 0.2.2 把每个入口包进 `panelEntry`（给图钉留位置），导航行不再是 `nav` 的直接子元素，`nav:has(> [class*="panelRow"])` 失效；
+- 同一根 `nav` 在纯 Web 页面里是竖排侧栏，只按「上边缘 < 60px」判断会把按钮摆进聊天区；
+- 右侧要给窗口按钮留 168px，窗口一窄就得隐藏——而「隐藏」等于这个功能在手机上完全够不到（0.4.7 只好再往「更多」菜单里加一行）。
+
+现在改成注册 `sidebar.panellist`（`order: 901`，紧跟「记忆」的 900）+ `main` 面板：
+
+- 位置、图标尺寸、hover/选中态、折叠成图标栏、Tooltip、语言切换都由侧边栏自己处理，插件不再测量任何 DOM 几何、也不再依赖 `nav` 的选择器；
+- 面板行点击即 `layout.selectPanel(id)`，而 `selectPanel` 对**未注册**的 key 直接抛错，所以面板行必须配一个 `main` 页面——确认气泡因此变成「重启应用与 Host」页面；
+- 面板行在所有布局里都存在，0.4.7 为 Web/手机补的「更多」菜单行、以及它背后那套 `openRequests` 跨组件通道都可以删掉。
+
+代价：重启从「胶囊气泡」变成「一页」，点一下会切走会话——换回来的是入口稳定、无需测量、四处布局一致。
+
 ## 重启的设备与工具入口
 
-`harness_restart`（以及按钮 `POST`）都走同一个 Host 函数 `lib/restart.js#requestRestart`：
+`harness_restart`（以及页面 `POST`）都走同一个 Host 函数 `lib/restart.js#requestRestart`：
 
 1. 只允许桌面 Host（`process.versions.electron` + 合法 `ppid`）；
 2. 抢 `restart.lock`（已有活跃计划则 `plan-busy`）；
@@ -142,25 +158,25 @@ Update for version 0.2.1-rc.5 is not available (latest version: 0.2.2-rc.1, down
 
 ## 版本握手
 
-客户端在弹确认框前 `GET` 同一路由：
+客户端在页面挂载时 `GET` 同一路由：
 
 ```json
 {
   "ok": true,
-  "version": "0.4.5",
+  "version": "0.4.8",
   "supported": true,
   "capabilities": ["restart", "resume", "tasks"],
   "lastPlan": { "planId": "rst-…", "at": 0, "finishedAt": 0, "ok": true, "resumed": 2, "tasks": 1 }
 }
 ```
 
-`version !== VERSION` 时不发重启请求，只提示「当前 Host 还是旧版本，先重开一次应用再试」；`supported === false` 提示仅桌面端可用。`lastPlan` 同时用于重启后的「已恢复 N 个会话」提示。
+`version !== VERSION` 时不发重启请求，只提示「当前 Host 还是旧版本，先重开一次应用再试」；`supported === false` 提示仅桌面端可用。`lastPlan` 同时用于页面顶部的「上次重启」回执和重启后那颗居中气泡。
 
 ## 语言解析
 
-客户端文案不依赖 `ctx.locale.bind()`：client locale 快照里的 `active` 是 **`zh`**（不是 `zh-CN`），按 `zh-CN` 注册的词典查不到，会一路退回英文。现在的取值顺序是：locale 服务（`active`/`id`/`locale`）→ 文档上的 `lang`/`data-locale`/`data-language` → `navigator.language`，任一是 `zh*` 就走中文，否则 `en*` 走英文，都没有则中文。
+客户端文案不依赖 `ctx.locale.bind()`（0.4.8 起也不再向 locale 服务注册词典：页面直接读 `client.js` 里的表）。取值顺序是 locale 服务（`active`/`id`/`locale`）→ 文档上的 `lang`/`data-locale`/`data-language` → `navigator.language`，**按顺序取第一个能判定语言的来源**：`zh*` 走中文、`en*` 走英文；都判定不了才退回中文。这样在中文系统上把应用语言切成英文，页面也是英文（早期版本是「任一中文提示源优先」，会把显式的英文覆盖掉）。
 
-续作指令的语言在 Host 侧决定：`continuationLanguage` 为 `zh`/`en` 时强制，`auto` 时读**发起重启的会话**最近一条用户消息（`session.snapshotEvents` 尾部 80 条），含汉字即中文，否则英文。按钮路径没有会话，用页面 POST 上来的 `language`。
+续作指令的语言在 Host 侧决定：`continuationLanguage` 为 `zh`/`en` 时强制，`auto` 时读**发起重启的会话**最近一条用户消息（`session.snapshotEvents` 尾部 80 条），含汉字即中文，否则英文。页面路径没有会话，用页面 POST 上来的 `language`。
 
 ## 排错表
 

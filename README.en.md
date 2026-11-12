@@ -2,21 +2,21 @@
 
 A **Restart** control and a **restart tool** for the DeepSeek Harness Desktop: restart the app and its Host after a confirmation, then have the interrupted Sessions continue automatically, with optional tasks queued for after the restart.
 
-> The Desktop Application menu is a native Electron menu. Its "Restart App and Host" item is gated behind `development` in `applicationItems()`, and a Cordis plugin cannot add items to a native menu. This bundle therefore puts its own restart entry on the same menu bar and exposes the same capability to Agents as tools.
+> The Desktop Application menu is a native Electron menu. Its "Restart App and Host" item is gated behind `development` in `applicationItems()`, and a Cordis plugin cannot add items to a native menu. This bundle therefore adds its own restart entry to the sidebar's panel list (right after 记忆) and exposes the same capability to Agents as tools.
 
 ## What you get
 
-- **Caption-band button** — right after the panel nav's overflow ("更多"). Its confirmation popover offers "Continue interrupted Sessions after the restart" (on by default) and a "Post-restart tasks" box, one task per line.
+- **Sidebar page** — one row in the panel list, immediately after the memory panel. It opens a restart page offering "Continue interrupted Sessions after the restart" (on by default) and a "Post-restart tasks" box, one task per line.
 - **Agent tools** — `harness_restart`, `harness_restart_status`, `harness_restart_cancel`.
 - **Automatic continuation** — every root Session that was inside a turn at the moment of the restart **and the subagents it was running** receives its own continuation instruction afterwards and continues from its last checkpoint without redoing finished work. A subagent is cold-resumed by its parent Session and sends its result back with `send_message`.
 - **Post-restart tasks** — each runs in a new Session (cwd / preset / title / `at` configurable) or in a named Session.
 - **Observability** — the plan, per-entry receipts, and failure reasons live on disk; the page reports "N Session(s) resumed, M task(s) started" once it is back.
 
-## The button
+## The entry
 
-- Desktop only: the panel nav must sit in the caption band (the `dsh-panel-titlebar` layout), or `[data-windows-menu]` must be at the top. A plain browser page never shows it.
-- Positioned 8px right of the overflow launcher, re-measured every second, hidden when the window has no room left of the native window controls.
-- A confirmation popover (`Esc` or click-away closes it), then the control reads "正在重启…".
+- One row in the sidebar's panel list (`sidebar.panellist`, `order: 901`), immediately after the memory panel (900) and before the overflow launcher. Desktop, Web and phone layouts all carry it; collapsing the sidebar leaves the icon, like every other panel entry.
+- It opens a "Restart the app and Host" page: the confirmation, the resume switch, the task box and any failure reason live there, and "Cancel" returns to the Conversation.
+- On mount the page asks the Host (`GET` on the same route) for its version and support; an outdated Host or a non-Desktop environment offers only "Cancel" and "Retry" and never posts a restart.
 - Bilingual (zh / en), following the app language.
 
 ## The tools
@@ -71,7 +71,7 @@ Every key is optional:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `resume` | `interrupted` | Button-path resume policy; also preselects the switch when the popover opens |
+| `resume` | `interrupted` | Page-path resume policy; also preselects the switch when the restart page first opens (a Retry never overwrites the user's edit) |
 | `requireApproval` | `true` | Use the Agent approval service for the tool |
 | `maxResumeSessions` | `8` | Sessions continued after one restart |
 | `staggerMs` | `800` | Pause between two continuation prompts |
@@ -80,7 +80,7 @@ Every key is optional:
 | `continuationLanguage` | `auto` | `auto` follows the conversation; `zh` / `en` force |
 | `flushTimeoutMs` | `3000` | Budget for flushing live Sessions before the kill |
 | `bootDelayMs` | `1500` | Wait after boot before restoring |
-| `maxTasks` | `8` | Tasks per plan (also the most task lines the popover accepts) |
+| `maxTasks` | `8` | Tasks per plan (also the most task lines the page accepts; the label states it) |
 | `storeDir` | `null` | Override the plan directory (default `$DSH_HOME/harness-restart`) |
 
 ### Turning the tool approval off (optional)
@@ -93,7 +93,7 @@ When the Session's approval policy is `never`, no card can appear and the tool f
     requireApproval: false
 ```
 
-The tradeoff is that the model may restart the app without a card (the caption-band button is unaffected: it has its own confirmation). With `patchReload: live` the change usually applies within seconds; otherwise on the next start.
+The tradeoff is that the model may restart the app without a card (the sidebar restart page is unaffected: it has its own confirmation). With `patchReload: live` the change usually applies within seconds; otherwise on the next start.
 
 ## Data and logs
 
